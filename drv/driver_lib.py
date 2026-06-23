@@ -1,0 +1,1410 @@
+#!/usr/bin/env python3
+"""
+Модуль: robot_driver.py
+Содержит:
+  - RobotDriver — базовый класс-клиент автопилота
+  - Узлы дерева поведения (BTNode, Sequence, Fallback, Parallel, Condition,
+    MoveRelativeAction, MoveTimeAction, StopAction, StreamAction,
+    HeartbeatAction, LogAction, RetryAction)
+  - MissionDispatcher — диспетчер миссий
+  - AIDecisionAction — узел принятия решений ИИ
+  - BehaviorTreeSquare — пример сценария «Квадрат» на дереве поведения
+
+Версия с гарантированной доставкой команд:
+  - Все Action-узлы проверяют ответ сервиса (Future + success)
+  - Таймауты на отправку и выполнение
+  - Обработка ABORTED-статусов и IDLE после приёма команды
+  - RetryAction сбрасывает состояние дочернего узла при повторе
+  - StreamAction для непрерывного управления по данным сенсоров
+  - MissionDispatcher для переключения миссий
+  - AIDecisionAction для принятия решений ИИ
+"""
+
+import rclpy, math
+from rclpy.node import Node
+from std_msgs.msg import Empty
+from std_srvs.srv import Trigger
+#import time
+
+from ifra_mol_1.srv import AutopilotTime, AutopilotRelative
+from ifra_mol_1.msg import AutopilotTelemetry
+
+
+# ==============================================================================
+# 1. БАЗОВЫЙ КЛАСС-КЛИЕНТ АВТОПИЛОТА (DRIVER)
+# ==============================================================================
+
+class RobotDriver(Node):
+    """
+    Универсальный робот-драйвер.
+    Два режима работы:
+      1. Старый: ручное управление _bt_root и таймером.
+      2. Новый: переопределите build_tree() и вызовите spin().
+    Предоставляет интерфейс к автопилоту, геттеры для лидара и камеры.
+    """
+
+    def __init__(self, node_name: str = 'robot_driver', tick_rate: float = None):
+        super().__init__(node_name)
+
+        # Сервис-клиенты
+        self._cli_time = self.create_client(AutopilotTime, 'autopilot/go_time')
+        self._cli_relative = self.create_client(AutopilotRelative, 'autopilot/go_relative')
+        self._cli_stop = self.create_client(Trigger, 'autopilot/stop')
+
+        # Телеметрия
+        self._telemetry_sub = self.create_subscription(
+            AutopilotTelemetry, '/autopilot/telemetry', self._on_telemetry, 10)
+        self._current_status = "IDLE"
+        self._current_x = self._current_y = self._current_yaw = 0.0
+        self._has_telemetry = False
+
+        # Heartbeat
+        self._hb_pub = self.create_publisher(Empty, '/autopilot/heartbeat', 10)
+
+        # Сенсоры
+        self._init_lidar()
+        self._init_camera()
+        self._init_vision()
+        self._init_neural()
+
+        # Режим запуска
+        self._active = False
+        self._debug = False
+
+        if tick_rate is not None:
+            # Новый режим: авто-запуск через build_tree()
+            self._mission_root = self.build_tree()
+            self._bt_root = Parallel([
+                HeartbeatAction(),
+                self._mission_root,
+            ], required_successes=1)
+            self._ticker = self.create_timer(1.0 / tick_rate, self._loop)
+            self.get_logger().info(f"Миссия готова, тик {tick_rate} Гц")
+        else:
+            # Старый режим: наследник сам создаст _bt_root и таймер
+            self._bt_root = None
+            self.get_logger().info("Драйвер готов (ручной режим)")
+
+        # Ожидание автопилота
+        self.get_logger().info("Ожидание автопилота...")
+        while not self._cli_time.wait_for_service(timeout_sec=1.0) and rclpy.ok():
+            self.get_logger().info("Повторное ожидание...")
+        self.get_logger().info("Автопилот подключён.")
+
+    # =====================================================================
+    # МИССИЯ (переопределите в наследнике для нового режима)
+    # =====================================================================
+
+    def build_tree(self) -> BTNode:
+        raise NotImplementedError("Переопределите build_tree()")
+
+    # =====================================================================
+    # ЗАПУСК
+    # =====================================================================
+
+    @property
+    def debug(self) -> bool:
+        return self._debug
+
+    @debug.setter
+    def debug(self, value: bool):
+        self._debug = value
+
+    def _loop(self):
+        if not self.is_connected():
+            return
+        if not self._active:
+            print(f"\nРобот готов к миссии '{self.__class__.__name__}'.")
+            input("Нажмите Enter для старта...")
+            self.get_logger().info(f"Лидар offset: x={self._lidar_offset_x:.3f}, y={self._lidar_offset_y:.3f}, ready={self._lidar_offset_ready}")
+            self.get_logger().info("Запуск миссии...")
+            self._active = True
+            return
+        status = self._bt_root.tick(self)
+        if self._debug:
+            self._print_tree()
+        if status == "SUCCESS":
+            self.get_logger().info("Миссия выполнена успешно!")
+            self.stop()
+            self.create_timer(0.5, lambda: rclpy.shutdown())
+        elif status == "FAILURE":
+            self.get_logger().error("Миссия провалена. Аварийная остановка.")
+            self.stop()
+            self.create_timer(0.5, lambda: rclpy.shutdown())
+
+    def _print_tree(self, node=None, indent=0):
+        if node is None:
+            node = self._bt_root
+        prefix = "  " * indent + ("→ " if indent > 0 else "")
+        name = getattr(node, 'name', node.__class__.__name__)
+        state = getattr(node, '_state', '')
+        state_str = f" [{state}]" if state else ""
+        self.get_logger().info(f"{prefix}{name}{state_str}")
+        for child in getattr(node, 'children', []):
+            self._print_tree(child, indent + 1)
+
+    @staticmethod
+    def spin(node: 'RobotDriver'):
+        try:
+            rclpy.spin(node)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                node.destroy_node()
+            except Exception:
+                pass
+            if rclpy.ok():
+                rclpy.shutdown()
+
+    # =====================================================================
+    # ИНТЕРФЕЙС АВТОПИЛОТА
+    # =====================================================================
+
+    def _on_telemetry(self, msg: AutopilotTelemetry):
+        self._current_status = msg.status
+        self._current_x = msg.x
+        self._current_y = msg.y
+        self._current_yaw = msg.yaw
+        self._has_telemetry = True
+
+    def get_status(self) -> str:
+        return self._current_status
+
+    def get_pose(self) -> tuple:
+        return (self._current_x, self._current_y, self._current_yaw)
+
+    def is_connected(self) -> bool:
+        return self._has_telemetry
+
+    def send_heartbeat(self):
+        self._hb_pub.publish(Empty())
+
+    def move_time(self, vx: float, vy: float, omega: float, duration: float):
+        req = AutopilotTime.Request()
+        req.vx = vx
+        req.vy = vy
+        req.omega = omega
+        req.duration = duration
+        return self._cli_time.call_async(req)
+
+    def move_relative(self, dx: float, dy: float, dyaw_deg: float):
+        req = AutopilotRelative.Request()
+        req.dx = dx
+        req.dy = dy
+        req.dyaw_deg = dyaw_deg
+        return self._cli_relative.call_async(req)
+
+    def stop(self):
+        req = Trigger.Request()
+        return self._cli_stop.call_async(req)
+
+    # =====================================================================
+    # СЕНСОРЫ: ЛИДАР
+    # =====================================================================
+
+    def _init_lidar(self):
+        from sensor_msgs.msg import LaserScan
+        from tf2_ros import Buffer, TransformListener
+        self._lidar_ranges = []
+        self._lidar_angle_min = 0.0
+        self._lidar_angle_increment = 0.0
+        self._tf_tree = {}
+        self._lidar_offset_ready = False
+        self._lidar_ready = False
+        self._lidar_offset_x = 0.0
+        self._lidar_offset_y = 0.0
+        self._lidar_offset_ready = False
+        self._tf_buffer = None
+        self._tf_listener = None
+        self.create_subscription(LaserScan, '/scan', self._on_lidar, 10)
+
+    def _update_lidar_offset(self):
+        if self._lidar_offset_ready or hasattr(self, '_tf_static_sub'):
+            return
+        try:
+            from tf2_msgs.msg import TFMessage
+            from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
+
+            static_qos = QoSProfile(
+                depth=100,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST
+            )
+
+            self._tf_static_sub = self.create_subscription(
+                TFMessage, '/tf_static', self._on_tf_static, static_qos)
+            self.get_logger().info("Подписка на /tf_static создана")
+        except Exception as e:
+            self.get_logger().warn(f"Не удалось подписаться на /tf_static: {e}")
+
+    def _on_tf_static(self, msg):
+        if self._lidar_offset_ready:
+            return
+
+        for t in msg.transforms:
+            self._tf_tree[t.child_frame_id] = (t.header.frame_id, t.transform.translation.x, t.transform.translation.y)
+
+        if 'lidar_link' in self._tf_tree:
+            x, y = 0.0, 0.0
+            frame = 'lidar_link'
+            max_depth = 20
+            depth = 0
+
+            while frame in self._tf_tree and depth < max_depth:
+                depth += 1
+                parent, dx, dy = self._tf_tree[frame]
+                x += dx
+                y += dy
+                frame = parent
+
+                if frame == 'base_link':
+                    self._lidar_offset_x = x
+                    self._lidar_offset_y = y
+                    self._lidar_offset_ready = True
+                    self.get_logger().info(f"Лидар смещён: x={x:.3f}, y={y:.3f}")
+                    self.destroy_subscription(self._tf_static_sub)
+                    return
+
+    def _transform_lidar_distance(self, angle_rad: float, measured: float) -> float:
+        if measured >= float('inf') or not self._lidar_offset_ready:
+            return measured
+        offset_proj = self._lidar_offset_x * math.cos(angle_rad) + self._lidar_offset_y * math.sin(angle_rad)
+        return max(0.0, measured - offset_proj)
+
+    def _on_lidar(self, msg):
+        self._lidar_ranges = list(msg.ranges)
+        if not self._lidar_ready:
+            self._lidar_angle_min = msg.angle_min
+            self._lidar_angle_increment = msg.angle_increment
+            self._lidar_ready = True
+        self._update_lidar_offset()
+
+    def get_lidar_ranges(self) -> list:
+        """Вернуть сырой массив замеров лидара."""
+        return self._lidar_ranges
+
+    def get_lidar_angle_min(self) -> float:
+        """Минимальный угол лидара (радиан)."""
+        return self._lidar_angle_min
+
+    def get_lidar_angle_increment(self) -> float:
+        """Шаг угла лидара (радиан)."""
+        return self._lidar_angle_increment
+
+    def _lidar_index(self, angle_rad: float) -> int:
+        while angle_rad < self._lidar_angle_min:
+            angle_rad += 2 * math.pi
+        while angle_rad >= self._lidar_angle_min + 2 * math.pi:
+            angle_rad -= 2 * math.pi
+        return int((angle_rad - self._lidar_angle_min) / self._lidar_angle_increment)
+
+    def _lidar_distance_at(self, angle_rad: float, default=float('inf')) -> float:
+        if not self._lidar_ready:
+            return default
+        idx = self._lidar_index(angle_rad)
+        if 0 <= idx < len(self._lidar_ranges):
+            val = self._lidar_ranges[idx]
+            return val if val > 0.01 else default
+        return default
+
+    def _lidar_min_in_range(self, start_rad: float, end_rad: float) -> float:
+        if not self._lidar_ready:
+            return float('inf')
+        start_idx = self._lidar_index(start_rad)
+        end_idx = self._lidar_index(end_rad) + 1
+        if start_idx <= end_idx:
+            vals = [v for v in self._lidar_ranges[start_idx:end_idx] if v > 0.01]
+        else:
+            vals = [v for v in self._lidar_ranges[start_idx:] + self._lidar_ranges[:end_idx] if v > 0.01]
+        return min(vals) if vals else float('inf')
+
+    def get_lidar_sector(self, center_rad: float, width_deg: float = 20.0) -> float:
+        """
+        Минимальное расстояние в секторе.
+        center_rad — центр сектора в радианах (0 — вперёд, ±π/2 — бока, ±π — назад).
+        width_deg — ширина сектора в градусах.
+        """
+        w = math.radians(width_deg / 2)
+        raw = self._lidar_min_in_range(center_rad - w, center_rad + w)
+        return self._transform_lidar_distance(center_rad, raw)
+
+    def get_lidar_front(self, width_deg: float = 30.0) -> float:
+        return self.get_lidar_sector(0.0, width_deg)
+
+    def get_lidar_right(self, width_deg: float = 20.0) -> float:
+        return self.get_lidar_sector(-math.pi/2, width_deg)
+
+    def get_lidar_left(self, width_deg: float = 20.0) -> float:
+        return self.get_lidar_sector(math.pi/2, width_deg)
+
+    def get_lidar_back(self, width_deg: float = 20.0) -> float:
+        return self.get_lidar_sector(math.pi, width_deg)
+
+    def get_lidar_min_distance(self) -> float:
+        if not self._lidar_ready:
+            return float('inf')
+        vals = [v for v in self._lidar_ranges if v > 0.01]
+        return self._transform_lidar_distance(0.0, min(vals)) if vals else float('inf')
+
+    def get_lidar_sectors(self, front_width=30, side_width=20) -> dict:
+        return {
+            "front": self.get_lidar_front(front_width),
+            "left": self.get_lidar_left(side_width),
+            "right": self.get_lidar_right(side_width),
+            "back": self.get_lidar_back(side_width),
+        }
+
+    # =====================================================================
+    # СЕНСОРЫ: КАМЕРА
+    # =====================================================================
+
+    def _init_camera(self):
+        from sensor_msgs.msg import Image
+        import cv2
+        from cv_bridge import CvBridge
+        self._cv_bridge = CvBridge()
+        self._last_frame = None
+        self._camera_ready = False
+        self.create_subscription(Image, '/camera/image_raw', self._on_camera, 10)
+
+    def _on_camera(self, msg):
+        import cv2
+        try:
+            self._last_frame = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self._camera_ready = True
+        except Exception:
+            pass
+
+    def get_frame(self):
+        return self._last_frame
+
+    def save_frame(self, filename: str = None) -> str:
+        import cv2
+        if self._last_frame is None:
+            return ""
+        if filename is None:
+            from datetime import datetime
+            filename = f"frame_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+        cv2.imwrite(filename, self._last_frame)
+        self.get_logger().info(f"Кадр сохранён: {filename}")
+        return filename
+
+    # =====================================================================
+    # СЕНСОРЫ: КОМПЬЮТЕРНОЕ ЗРЕНИЕ (OpenCV)
+    # =====================================================================
+
+    def _init_vision(self):
+        """Поля для результатов компьютерного зрения."""
+        # Детектирование линии
+        self._line_offset = 0.0
+        self._line_angle = 0.0
+        self._line_detected = False
+
+        # Трекинг объекта
+        self._object_x = 0.0
+        self._object_y = 0.0
+        self._object_detected = False
+
+        # ArUco-маркеры
+        self._marker_ids = []
+        self._marker_poses = {}
+        self._markers_detected = False
+
+        # Оптический поток
+        self._flow_dx = 0.0
+        self._flow_dy = 0.0
+        self._flow_ready = False
+
+    def set_line_info(self, offset: float, angle: float, detected: bool = True):
+        self._line_offset = offset
+        self._line_angle = angle
+        self._line_detected = detected
+
+    def get_line_position(self) -> tuple:
+        return (self._line_offset, self._line_angle, self._line_detected)
+
+    def set_object_position(self, x: float, y: float, detected: bool = True):
+        self._object_x = x
+        self._object_y = y
+        self._object_detected = detected
+
+    def get_object_position(self) -> tuple:
+        return (self._object_x, self._object_y, self._object_detected)
+
+    def set_marker_info(self, ids: list, poses: dict):
+        self._marker_ids = ids
+        self._marker_poses = poses
+        self._markers_detected = len(ids) > 0
+
+    def get_marker_info(self) -> tuple:
+        return (self._marker_ids, self._marker_poses, self._markers_detected)
+
+    def get_marker_id(self):
+        return self._marker_ids[0] if self._marker_ids else None
+
+    def set_optical_flow(self, dx: float, dy: float):
+        self._flow_dx = dx
+        self._flow_dy = dy
+        self._flow_ready = True
+
+    def get_optical_flow(self) -> tuple:
+        return (self._flow_dx, self._flow_dy, self._flow_ready)
+
+    # =====================================================================
+    # СЕНСОРЫ: НЕЙРОСЕТИ (PyTorch / Hailo-8)
+    # =====================================================================
+
+    def _init_neural(self):
+        """Поля для результатов нейросетевого детектирования."""
+        self._detections = []          # [(class_name, confidence, x1, y1, x2, y2), ...]
+        self._detections_ready = False
+
+    def set_detections(self, detections: list):
+        self._detections = detections
+        self._detections_ready = True
+
+    def get_detections(self) -> list:
+        return self._detections
+
+    def has_detections(self) -> bool:
+        return self._detections_ready and len(self._detections) > 0
+
+    def is_class_detected(self, class_name: str) -> bool:
+        return any(d[0] == class_name for d in self._detections)
+
+    def is_person_detected(self) -> bool:
+        return self.is_class_detected("person")
+
+    def get_detections_by_class(self, class_name: str) -> list:
+        return [d for d in self._detections if d[0] == class_name]
+
+# ==============================================================================
+# 2. ЯДРО ДЕРЕВА ПОВЕДЕНИЯ
+# ==============================================================================
+
+class BTNode:
+    """Абстрактный узел дерева поведения."""
+
+    def tick(self, driver: RobotDriver) -> str:
+        raise NotImplementedError("Переопределите tick в наследнике")
+
+    def reset(self):
+        """Сброс внутреннего состояния. По умолчанию ничего не делает."""
+        pass
+
+
+class Sequence(BTNode):
+    """Последовательное «И»: все дети должны завершиться SUCCESS."""
+
+    def __init__(self, children: list):
+        self.children = children
+        self._idx = 0
+
+    def reset(self):
+        self._idx = 0
+        for child in self.children:
+            child.reset()
+
+    def tick(self, driver: RobotDriver) -> str:
+        if self._idx >= len(self.children):
+            return "SUCCESS"
+
+        status = self.children[self._idx].tick(driver)
+
+        if status == "RUNNING":
+            return "RUNNING"
+        elif status == "FAILURE":
+            return "FAILURE"
+        elif status == "SUCCESS":
+            driver.get_logger().info(
+                f"[Sequence] Узел {self._idx + 1}/{len(self.children)} завершён"
+            )
+            self._idx += 1
+            return "RUNNING"
+
+
+class Fallback(BTNode):
+    """Селектор «ИЛИ»: первый SUCCESS останавливает узел."""
+
+    def __init__(self, children: list):
+        self.children = children
+        self._idx = 0
+
+    def reset(self):
+        self._idx = 0
+        for child in self.children:
+            child.reset()
+
+    def tick(self, driver: RobotDriver) -> str:
+        if self._idx >= len(self.children):
+            return "FAILURE"
+
+        status = self.children[self._idx].tick(driver)
+
+        if status == "RUNNING":
+            return "RUNNING"
+        elif status == "SUCCESS":
+            return "SUCCESS"
+        elif status == "FAILURE":
+            self._idx += 1
+            return "RUNNING"
+
+
+class Parallel(BTNode):
+    """Параллельный узел: все дети тикаются одновременно."""
+
+    def __init__(self, children: list, required_successes: int = None):
+        self.children = children
+        self.required = required_successes if required_successes is not None else len(children)
+        self._child_statuses = ["RUNNING"] * len(children)
+
+    def reset(self):
+        self._child_statuses = ["RUNNING"] * len(self.children)
+        for child in self.children:
+            child.reset()
+
+    def tick(self, driver: RobotDriver) -> str:
+        successes = 0
+        failures = 0
+        for i, child in enumerate(self.children):
+            if self._child_statuses[i] == "RUNNING":
+                self._child_statuses[i] = child.tick(driver)
+            if self._child_statuses[i] == "SUCCESS":
+                successes += 1
+            elif self._child_statuses[i] == "FAILURE":
+                failures += 1
+
+        if successes >= self.required:
+            return "SUCCESS"
+        if failures > 0:
+            return "FAILURE"
+        return "RUNNING"
+
+
+class Condition(BTNode):
+    """Проверка условия — мгновенный SUCCESS или FAILURE."""
+
+    def __init__(self, check_func):
+        self._check = check_func
+
+    def tick(self, driver: RobotDriver) -> str:
+        return "SUCCESS" if self._check(driver) else "FAILURE"
+
+
+# ==============================================================================
+# 3. БИБЛИОТЕКА УЗЛОВ-ДЕЙСТВИЙ
+# ==============================================================================
+
+class MoveRelativeAction(BTNode):
+    """
+    Относительное перемещение через сервис go_relative.
+    Гарантирует проверку ответа сервиса и таймауты.
+    Состояния: START → WAITING_RESPONSE → MOVING → SUCCESS / FAILURE
+    """
+
+    def __init__(self, dx: float = 0.0, dy: float = 0.0, dyaw_deg: float = 0.0,
+                 name: str = "",
+                 send_timeout: float = 2.0,
+                 exec_timeout: float = 30.0):
+        self.dx = dx
+        self.dy = dy
+        self.dyaw_deg = dyaw_deg
+        self.name = name or f"Move(dx={dx},dy={dy},yaw={dyaw_deg})"
+        self._send_timeout = send_timeout
+        self._exec_timeout = exec_timeout
+        self._state = "START"
+        self._future = None
+        self._state_start_time = None
+
+    def _log(self, driver, msg: str):
+        driver.get_logger().info(f"[BT] {self.name}: {msg}")
+
+    def _warn(self, driver, msg: str):
+        driver.get_logger().warn(f"[BT] {self.name}: {msg}")
+
+    def _error(self, driver, msg: str):
+        driver.get_logger().error(f"[BT] {self.name}: {msg}")
+
+    def tick(self, driver: RobotDriver) -> str:
+        now = driver.get_clock().now().nanoseconds * 1e-9
+
+        if self._state == "START":
+            self._log(driver, "Отправка go_relative...")
+            dx = self.dx(driver) if callable(self.dx) else self.dx
+            dy = self.dy(driver) if callable(self.dy) else self.dy
+            dyaw = self.dyaw_deg(driver) if callable(self.dyaw_deg) else self.dyaw_deg
+            self._future = driver.move_relative(dx, dy, dyaw)
+            self._state = "WAITING_RESPONSE"
+            self._state_start_time = now
+            return "RUNNING"
+
+        elif self._state == "WAITING_RESPONSE":
+            if now - self._state_start_time > self._send_timeout:
+                self._error(driver, f"Сервис не ответил за {self._send_timeout}с")
+                self.reset()
+                return "FAILURE"
+
+            if self._future is None:
+                self._error(driver, "Future is None")
+                self.reset()
+                return "FAILURE"
+
+            if not self._future.done():
+                return "RUNNING"
+
+            response = self._future.result()
+            if response is None:
+                self._error(driver, "Ответ: None")
+                self.reset()
+                return "FAILURE"
+
+            if not response.success:
+                self._error(driver, f"Отклонено: {response.status_message}")
+                self.reset()
+                return "FAILURE"
+
+            self._log(driver, f"Принято: {response.status_message}")
+            self._state = "MOVING"
+            self._state_start_time = now
+            return "RUNNING"
+
+        elif self._state == "MOVING":
+            if now - self._state_start_time > self._exec_timeout:
+                self._error(driver, f"Таймаут выполнения ({self._exec_timeout}с)")
+                driver.stop()
+                self.reset()
+                return "FAILURE"
+
+            status = driver.get_status()
+
+            if status == "MOVING":
+                return "RUNNING"
+            elif status == "SUCCESS":
+                self._log(driver, "Успешно")
+                self.reset()
+                return "SUCCESS"
+            elif status in ("ABORTED_STUCK", "ABORTED_TIMEOUT"):
+                self._error(driver, f"Статус: {status}")
+                self.reset()
+                return "FAILURE"
+            elif status == "IDLE":
+                if now - self._state_start_time > 3.0:
+                    self._warn(driver, "IDLE > 3 сек после приёма")
+                    self.reset()
+                    return "FAILURE"
+                return "RUNNING"
+
+            return "RUNNING"
+
+        return "RUNNING"
+
+    def reset(self):
+        self._state = "START"
+        self._future = None
+        self._state_start_time = None
+
+
+class MoveTimeAction(BTNode):
+    """
+    Движение по времени через сервис go_time.
+    Гарантирует проверку ответа сервиса и таймауты.
+    Состояния: START → WAITING_RESPONSE → MOVING → SUCCESS / FAILURE
+    """
+
+    def __init__(self, vx: float = 0.0, vy: float = 0.0, omega: float = 0.0,
+                 duration: float = 1.0, name: str = "",
+                 send_timeout: float = 2.0, exec_timeout: float = 30.0):
+        self.vx = vx
+        self.vy = vy
+        self.omega = omega
+        self.duration = duration
+        self.name = name or f"Time(vx={vx},vy={vy},omega={omega},{duration}s)"
+        self._send_timeout = send_timeout
+        self._exec_timeout = exec_timeout
+        self._state = "START"
+        self._future = None
+        self._state_start_time = None
+
+    def _log(self, driver, msg: str):
+        driver.get_logger().info(f"[BT] {self.name}: {msg}")
+
+    def _warn(self, driver, msg: str):
+        driver.get_logger().warn(f"[BT] {self.name}: {msg}")
+
+    def _error(self, driver, msg: str):
+        driver.get_logger().error(f"[BT] {self.name}: {msg}")
+
+    def tick(self, driver: RobotDriver) -> str:
+        now = driver.get_clock().now().nanoseconds * 1e-9
+
+        if self._state == "START":
+            self._log(driver, "Отправка go_time...")
+            vx = self.vx(driver) if callable(self.vx) else self.vx
+            vy = self.vy(driver) if callable(self.vy) else self.vy
+            omega = self.omega(driver) if callable(self.omega) else self.omega
+            duration = self.duration(driver) if callable(self.duration) else self.duration
+            self._future = driver.move_time(vx, vy, omega, duration)
+            self._state = "WAITING_RESPONSE"
+            self._state_start_time = now
+            return "RUNNING"
+
+        elif self._state == "WAITING_RESPONSE":
+            if now - self._state_start_time > self._send_timeout:
+                self._error(driver, f"Сервис не ответил за {self._send_timeout}с")
+                self.reset()
+                return "FAILURE"
+
+            if self._future is None:
+                self._error(driver, "Future is None")
+                self.reset()
+                return "FAILURE"
+
+            if not self._future.done():
+                return "RUNNING"
+
+            response = self._future.result()
+            if response is None:
+                self._error(driver, "Ответ: None")
+                self.reset()
+                return "FAILURE"
+
+            if not response.success:
+                self._error(driver, f"Отклонено: {response.status_message}")
+                self.reset()
+                return "FAILURE"
+
+            self._log(driver, f"Принято: {response.status_message}")
+            self._state = "MOVING"
+            self._state_start_time = now
+            return "RUNNING"
+
+        elif self._state == "MOVING":
+            if now - self._state_start_time > self._exec_timeout:
+                self._error(driver, f"Таймаут выполнения ({self._exec_timeout}с)")
+                driver.stop()
+                self.reset()
+                return "FAILURE"
+
+            status = driver.get_status()
+
+            if status == "MOVING":
+                return "RUNNING"
+            elif status == "SUCCESS":
+                self._log(driver, "Успешно")
+                self.reset()
+                return "SUCCESS"
+            elif status in ("ABORTED_STUCK", "ABORTED_TIMEOUT"):
+                self._error(driver, f"Статус: {status}")
+                self.reset()
+                return "FAILURE"
+            elif status == "IDLE":
+                if now - self._state_start_time > 3.0:
+                    self._warn(driver, "IDLE > 3 сек после приёма")
+                    self.reset()
+                    return "FAILURE"
+                return "RUNNING"
+
+            return "RUNNING"
+
+        return "RUNNING"
+
+    def reset(self):
+        self._state = "START"
+        self._future = None
+        self._state_start_time = None
+
+
+class StopAction(BTNode):
+    """
+    Экстренная остановка через сервис stop.
+    Гарантирует проверку ответа сервиса.
+    Состояния: START → WAITING_RESPONSE → SUCCESS / FAILURE
+    """
+
+    def __init__(self, name: str = "Stop", send_timeout: float = 2.0):
+        self.name = name
+        self._send_timeout = send_timeout
+        self._state = "START"
+        self._future = None
+        self._state_start_time = None
+
+    def _log(self, driver, msg: str):
+        driver.get_logger().info(f"[BT] {self.name}: {msg}")
+
+    def _error(self, driver, msg: str):
+        driver.get_logger().error(f"[BT] {self.name}: {msg}")
+
+    def tick(self, driver: RobotDriver) -> str:
+        now = driver.get_clock().now().nanoseconds * 1e-9
+
+        if self._state == "START":
+            self._log(driver, "Отправка stop...")
+            self._future = driver.stop()
+            self._state = "WAITING_RESPONSE"
+            self._state_start_time = now
+            return "RUNNING"
+
+        elif self._state == "WAITING_RESPONSE":
+            if now - self._state_start_time > self._send_timeout:
+                self._error(driver, f"Сервис не ответил за {self._send_timeout}с")
+                self.reset()
+                return "FAILURE"
+
+            if self._future is None:
+                self._error(driver, "Future is None")
+                self.reset()
+                return "FAILURE"
+
+            if not self._future.done():
+                return "RUNNING"
+
+            response = self._future.result()
+            if response is None:
+                self._error(driver, "Ответ: None")
+                self.reset()
+                return "FAILURE"
+
+            if not response.success:
+                self._error(driver, f"Отклонено: {response.message}")
+                self.reset()
+                return "FAILURE"
+
+            self._log(driver, "Остановка подтверждена")
+            self.reset()
+            return "SUCCESS"
+
+        return "RUNNING"
+
+    def reset(self):
+        self._state = "START"
+        self._future = None
+        self._state_start_time = None
+
+
+class HeartbeatAction(BTNode):
+    """Бесконечная отправка heartbeat. Всегда возвращает RUNNING."""
+
+    def tick(self, driver: RobotDriver) -> str:
+        driver.send_heartbeat()
+        return "RUNNING"
+
+
+class EvalAction(BTNode):
+    """Вычисляет переданную функцию и логирует результат. Мгновенный SUCCESS."""
+    def __init__(self, func, name="Eval"):
+        self._func = func
+        self.name = name
+        self._done = False
+
+    def tick(self, driver) -> str:
+        if not self._done:
+            result = self._func(driver)
+            driver.get_logger().info(f"[BT] {self.name}: {result}")
+            self._done = True
+        return "SUCCESS"
+
+    def reset(self):
+        self._done = False
+
+class LogAction(BTNode):
+    """Печать сообщения в лог. Мгновенный SUCCESS."""
+
+    def __init__(self, message: str):
+        self._msg = message
+        self._done = False
+
+    def tick(self, driver: RobotDriver) -> str:
+        if not self._done:
+            driver.get_logger().info(f"[BT] {self._msg}")
+            self._done = True
+        return "SUCCESS"
+
+    def reset(self):
+        self._done = False
+
+
+class RetryAction(BTNode):
+    """Повторить дочерний узел до N раз при FAILURE."""
+
+    def __init__(self, child: BTNode, max_attempts: int = 3):
+        self.child = child
+        self.max_attempts = max_attempts
+        self._attempt = 0
+
+    def tick(self, driver: RobotDriver) -> str:
+        status = self.child.tick(driver)
+
+        if status == "SUCCESS":
+            self._attempt = 0
+            return "SUCCESS"
+        elif status == "FAILURE":
+            self._attempt += 1
+            driver.get_logger().warning(
+                f"[Retry] Попытка {self._attempt}/{self.max_attempts} провалена"
+            )
+            self.child.reset()
+            if self._attempt >= self.max_attempts:
+                self._attempt = 0
+                return "FAILURE"
+            return "RUNNING"
+        return "RUNNING"
+
+class StreamAction(BTNode):
+    """
+    Потоковое действие: на каждом тике заново вызывает go_time
+    с обновлёнными параметрами на основе данных сенсоров.
+    Контроллер перезаписывает цель при повторном вызове.
+    Возвращает RUNNING пока условие завершения не выполнено.
+    
+    Если одометрия не меняется за 1 секунду, но условие остановки 
+    не выполнено — выводит предупреждение (не чаще 1 раза в секунду).
+    """
+
+    def __init__(self, command_func, stop_condition=None, 
+                 name="Stream", 
+                 stuck_xy_threshold=0.02,    # 2 см за секунду
+                 stuck_yaw_threshold=0.05):  # ~3° за секунду
+        """
+        command_func(driver) -> (vx, vy, omega, duration)
+        stop_condition(driver) -> bool (опционально, если None — бесконечное)
+        stuck_xy_threshold: мин. изменение позиции (м) за секунду
+        stuck_yaw_threshold: мин. изменение угла (рад) за секунду
+        """
+        self._command_func = command_func
+        self._stop_condition = stop_condition
+        self.name = name
+        self._stuck_xy_threshold = stuck_xy_threshold
+        self._stuck_yaw_threshold = stuck_yaw_threshold
+        self._started = False
+        self._last_warn_time = 0.0
+        self._last_check_time = 0.0
+        self._check_start_x = 0.0
+        self._check_start_y = 0.0
+        self._check_start_yaw = 0.0
+        self._check_interval = 1.0  # Проверяем раз в секунду
+
+    def _log(self, driver, msg: str):
+        driver.get_logger().info(f"[BT] {self.name}: {msg}")
+
+    def _warn(self, driver, msg: str):
+        driver.get_logger().warning(f"[BT] {self.name}: {msg}")
+
+    def tick(self, driver: RobotDriver) -> str:
+        if self._started and self._stop_condition and self._stop_condition(driver):
+            self._log(driver, "Условие завершения выполнено")
+            driver.stop()
+            return "SUCCESS"
+
+        current_x, current_y, current_yaw = driver.get_pose()
+        now = driver.get_clock().now().nanoseconds * 1e-9
+        
+        # Инициализация точки отсчёта
+        if not self._started:
+            self._check_start_x = current_x
+            self._check_start_y = current_y
+            self._check_start_yaw = current_yaw
+            self._last_check_time = now
+        
+        # Проверка раз в секунду
+        if self._started and self._stop_condition and now - self._last_check_time >= self._check_interval:
+            dx = abs(current_x - self._check_start_x)
+            dy = abs(current_y - self._check_start_y)
+            dyaw = abs(current_yaw - self._check_start_yaw)
+            
+            if (dx < self._stuck_xy_threshold and 
+                dy < self._stuck_xy_threshold and 
+                dyaw < self._stuck_yaw_threshold):
+                if now - self._last_warn_time >= 1.0:
+                    self._warn(driver, 
+                        f"Одометрия не меняется за {self._check_interval}с: "
+                        f"dx={dx:.3f}м, dy={dy:.3f}м, dyaw={dyaw:.3f}рад "
+                        f"(пороги: xy={self._stuck_xy_threshold}м, yaw={self._stuck_yaw_threshold}рад). "
+                        f"Робот мог застрять."
+                    )
+                    self._last_warn_time = now
+            
+            # Сброс точки отсчёта
+            self._check_start_x = current_x
+            self._check_start_y = current_y
+            self._check_start_yaw = current_yaw
+            self._last_check_time = now
+        
+        vx, vy, omega, duration = self._command_func(driver)
+        driver.move_time(vx, vy, omega, duration)
+        self._started = True
+        return "RUNNING"
+
+    def reset(self):
+        self._started = False
+        self._last_warn_time = 0.0
+        self._last_check_time = 0.0
+
+# ==============================================================================
+# 3.1 ВСПОМОГАТЕЛЬНЫЕ УЗЛЫ (WaitCondition, RepeatUntil, TimerAction)
+# ==============================================================================
+
+class WaitCondition(BTNode):
+    """
+    Ждать пока условие не станет истиной.
+    Возвращает RUNNING пока ждёт, SUCCESS когда условие выполнено,
+    FAILURE если истёк таймаут.
+    """
+
+    def __init__(self, check_func, timeout: float = 10.0, name: str = "Wait"):
+        self._check = check_func       # (driver) -> bool
+        self._timeout = timeout
+        self.name = name
+        self._start_time = None
+
+    def _log(self, driver, msg: str):
+        driver.get_logger().info(f"[BT] {self.name}: {msg}")
+
+    def _warn(self, driver, msg: str):
+        driver.get_logger().warning(f"[BT] {self.name}: {msg}")
+
+    def tick(self, driver: RobotDriver) -> str:
+        if self._start_time is None:
+            self._start_time = driver.get_clock().now().nanoseconds * 1e-9
+
+        if driver.get_clock().now().nanoseconds * 1e-9 - self._start_time > self._timeout:
+            self._warn(driver, f"Таймаут {self._timeout}с истёк")
+            self._start_time = None
+            return "FAILURE"
+
+        if self._check(driver):
+            self._log(driver, "Условие выполнено")
+            self._start_time = None
+            return "SUCCESS"
+
+        return "RUNNING"
+
+    def reset(self):
+        self._start_time = None
+
+
+class RepeatUntil(BTNode):
+    """
+    Повторяет дочерний узел пока условие не станет истиной.
+    Когда условие выполнено — возвращает SUCCESS.
+    Если дочерний узел вернул FAILURE — возвращает FAILURE.
+    """
+
+    def __init__(self, child: BTNode, stop_condition, name: str = "RepeatUntil"):
+        self.child = child
+        self._stop = stop_condition     # (driver) -> bool
+        self.name = name
+
+    def _log(self, driver, msg: str):
+        driver.get_logger().info(f"[BT] {self.name}: {msg}")
+
+    def tick(self, driver: RobotDriver) -> str:
+        if self._stop(driver):
+            self._log(driver, "Условие остановки выполнено")
+            return "SUCCESS"
+
+        status = self.child.tick(driver)
+        if status == "FAILURE":
+            return "FAILURE"
+        if status == "SUCCESS":
+            self.child.reset()  # <-- ВОТ ЭТО НУЖНО ДОБАВИТЬ
+        return "RUNNING"
+
+    def reset(self):
+        self.child.reset()
+
+
+class TimerAction(BTNode):
+    """
+    Выполняет дочерний узел заданное время, затем возвращает SUCCESS.
+    Если дочерний узел вернул FAILURE — возвращает FAILURE досрочно.
+    """
+
+    def __init__(self, child: BTNode, duration: float, name: str = "Timer"):
+        self.child = child
+        self.duration = duration
+        self.name = name
+        self._start_time = None
+
+    def _log(self, driver, msg: str):
+        driver.get_logger().info(f"[BT] {self.name}: {msg}")
+
+    def tick(self, driver: RobotDriver) -> str:
+        if self._start_time is None:
+            self._start_time = driver.get_clock().now().nanoseconds * 1e-9
+
+        if driver.get_clock().now().nanoseconds * 1e-9 - self._start_time > self.duration:
+            self._log(driver, f"Время {self.duration}с истекло")
+            return "SUCCESS"
+
+        status = self.child.tick(driver)
+        if status == "FAILURE":
+            return "FAILURE"
+        return "RUNNING"
+
+    def reset(self):
+        self._start_time = None
+        self.child.reset()
+
+
+# ==============================================================================
+# 3.2 BLACKBOARD — общая память между узлами
+# ==============================================================================
+
+class Blackboard:
+    """
+    Общая память дерева поведения.
+    Позволяет узлам обмениваться данными без засорения RobotDriver.
+    """
+
+    def __init__(self):
+        self._data = {}
+
+    def set(self, key: str, value):
+        self._data[key] = value
+
+    def get(self, key: str, default=None):
+        return self._data.get(key, default)
+
+    def has(self, key: str) -> bool:
+        return key in self._data
+
+    def delete(self, key: str):
+        if key in self._data:
+            del self._data[key]
+
+    def clear(self):
+        self._data.clear()
+
+    def all(self) -> dict:
+        return dict(self._data)
+
+
+# ==============================================================================
+# 3.3 SUBTREE — переиспользуемый фрагмент дерева
+# ==============================================================================
+
+class SubTree(BTNode):
+    """
+    Ссылка на именованный фрагмент дерева.
+    Поддерживает ленивую подстановку: корень может быть установлен после создания.
+    """
+
+    def __init__(self, name: str = "SubTree"):
+        self.name = name
+        self._root: BTNode = None
+
+    def set_root(self, root: BTNode):
+        self._root = root
+
+    def tick(self, driver: RobotDriver) -> str:
+        if self._root is None:
+            driver.get_logger().error(f"[BT] {self.name}: корень не установлен")
+            return "FAILURE"
+        return self._root.tick(driver)
+
+    def reset(self):
+        if self._root is not None:
+            self._root.reset()
+
+# ==============================================================================
+# 4. ДИСПЕТЧЕР МИССИЙ И УЗЕЛ ПРИНЯТИЯ РЕШЕНИЙ ИИ
+# ==============================================================================
+
+class MissionDispatcher(RobotDriver):
+    """
+    Диспетчер миссий.
+    Хранит реестр миссий, запускает и прерывает их.
+    Может использоваться как самостоятельно, так и внутри AIDecisionAction.
+    """
+
+    def __init__(self, node_name: str = 'mission_dispatcher'):
+        super().__init__(node_name)
+
+        self._missions: dict = {}
+        self._current_mission_name: str = "IDLE"
+        self._current_mission_root: BTNode = None
+
+        self._ticker = self.create_timer(0.2, self._mission_loop)
+        self.get_logger().info("Диспетчер миссий готов")
+
+    def register_mission(self, name: str, root_node: BTNode):
+        self._missions[name] = root_node
+        self.get_logger().info(f"Миссия зарегистрирована: {name}")
+
+    def start_mission(self, name: str):
+        if name not in self._missions:
+            self.get_logger().error(f"Миссия не найдена: {name}")
+            return
+
+        if self._current_mission_name == name:
+            return
+
+        self.stop()
+        self.get_logger().info(f"Запуск миссии: {self._current_mission_name} → {name}")
+        self._current_mission_name = name
+        self._current_mission_root = self._missions[name]
+
+    def abort_mission(self):
+        self.get_logger().info(f"Прерывание миссии: {self._current_mission_name}")
+        self.stop()
+        self._current_mission_name = "IDLE"
+        self._current_mission_root = None
+
+    def get_current_mission(self) -> str:
+        return self._current_mission_name
+
+    def _mission_loop(self):
+        #self.send_heartbeat()
+
+        if self._current_mission_root is None:
+            return
+
+        status = self._current_mission_root.tick(self)
+
+        if status == "SUCCESS":
+            self.get_logger().info(f"Миссия {self._current_mission_name} завершена успешно")
+            self._current_mission_name = "IDLE"
+            self._current_mission_root = None
+        elif status == "FAILURE":
+            self.get_logger().error(f"Миссия {self._current_mission_name} провалена")
+            self.stop()
+            self._current_mission_name = "IDLE"
+            self._current_mission_root = None
+
+
+class AIDecisionAction(BTNode):
+    """
+    Узел принятия решений.
+    На каждом тике вызывает decision_func(driver) -> имя миссии.
+    Если миссия изменилась — прерывает старую, запускает новую.
+    Тикает текущую миссию.
+    Возвращает RUNNING всегда.
+    """
+
+    def __init__(self, decision_func):
+        """
+        decision_func(driver) -> str  (имя миссии)
+        """
+        self._decision_func = decision_func
+        self._current_mission_name = None
+        self._current_mission_root = None
+        self._missions = {}
+
+    def register_mission(self, name: str, root_node: BTNode):
+        self._missions[name] = root_node
+
+    def _switch_mission(self, driver: MissionDispatcher, new_name: str):
+        if self._current_mission_name == new_name:
+            return
+
+        driver.stop()
+        driver.get_logger().info(f"[AI] Смена миссии: {self._current_mission_name} → {new_name}")
+        self._current_mission_name = new_name
+        self._current_mission_root = self._missions.get(new_name)
+
+    def tick(self, driver: MissionDispatcher) -> str:
+        new_mission = self._decision_func(driver)
+        self._switch_mission(driver, new_mission)
+
+        if self._current_mission_root is not None:
+            status = self._current_mission_root.tick(driver)
+            if status == "FAILURE":
+                driver.get_logger().error(f"[AI] Миссия {self._current_mission_name} провалена")
+                self._current_mission_name = None
+                self._current_mission_root = None
+
+        return "RUNNING"
+
+    def reset(self):
+        self._current_mission_name = None
+        self._current_mission_root = None
+
+
+# ==============================================================================
+# 5. ПРИМЕР СЦЕНАРИЯ — КВАДРАТ НА ДЕРЕВЕ ПОВЕДЕНИЯ
+# ==============================================================================
+
+class BehaviorTreeSquare(RobotDriver):
+    """
+    Робот проезжает квадрат со стороной side_length метров.
+    Использует дерево поведения: Sequence из 8 MoveRelativeAction,
+    Heartbeat в параллель, Retry на прямолинейных участках.
+    """
+
+    def __init__(self, side_length: float = 1.0):
+        super().__init__('bt_square')
+
+        self._bt_root = Parallel(
+            [
+                HeartbeatAction(),
+                Sequence([
+                    LogAction("Старт миссии: Квадрат"),
+                    RetryAction(MoveRelativeAction(dx=side_length, dy=0.0, dyaw_deg=0.0,
+                                                   name="Вперёд 1")),
+                    MoveRelativeAction(dx=0.0, dy=0.0, dyaw_deg=90.0, name="Поворот 1"),
+                    RetryAction(MoveRelativeAction(dx=side_length, dy=0.0, dyaw_deg=0.0,
+                                                   name="Вперёд 2")),
+                    MoveRelativeAction(dx=0.0, dy=0.0, dyaw_deg=90.0, name="Поворот 2"),
+                    RetryAction(MoveRelativeAction(dx=side_length, dy=0.0, dyaw_deg=0.0,
+                                                   name="Вперёд 3")),
+                    MoveRelativeAction(dx=0.0, dy=0.0, dyaw_deg=90.0, name="Поворот 3"),
+                    RetryAction(MoveRelativeAction(dx=side_length, dy=0.0, dyaw_deg=0.0,
+                                                   name="Вперёд 4")),
+                    MoveRelativeAction(dx=0.0, dy=0.0, dyaw_deg=90.0, name="Поворот 4"),
+                    LogAction("Миссия завершена успешно!"),
+                ]),
+            ],
+            required_successes=1
+        )
+
+        self._active = False
+        self._ticker = self.create_timer(0.2, self._loop)
+        self.get_logger().info(f"[BT Square] Дерево готово. Сторона: {side_length} м")
+
+    def _loop(self):
+        if not self.is_connected():
+            return
+
+        if not self._active:
+            print("\nРобот готов к миссии 'Квадрат'.")
+            input("Нажмите Enter для старта...")
+            self._active = True
+            return
+
+        status = self._bt_root.tick(self)
+
+        if status == "SUCCESS":
+            self.get_logger().info("Дерево выполнено успешно!")
+            self.stop()
+            self.create_timer(0.5, lambda: rclpy.shutdown())
+        elif status == "FAILURE":
+            self.get_logger().error("Дерево вернуло FAILURE. Аварийная остановка.")
+            self.stop()
+            self.create_timer(0.5, lambda: rclpy.shutdown())
+
+
+# ==============================================================================
+# 6. ТОЧКА ВХОДА
+# ==============================================================================
+
+def main():
+    import sys
+    rclpy.init()
+    side = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+    node = BehaviorTreeSquare(side)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

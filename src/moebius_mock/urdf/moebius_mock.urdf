@@ -1,0 +1,90 @@
+<?xml version="1.0"?>
+<robot name="moebius_mock">
+
+  <!-- Материалы и цвета -->
+  <material name="black">  <color rgba="0.1 0.1 0.1 1"/> </material>
+  <material name="gray">   <color rgba="0.5 0.5 0.5 1"/> </material>
+  <material name="blue">   <color rgba="0.0 0.0 0.8 1"/> </material>
+
+  <!-- Базовая точка робота (Центр проекции на землю) -->
+  <link name="base_link"/>
+
+  <!-- Шасси / Корпус -->
+  <link name="chassis_link">
+    <visual>
+      <geometry> <box size="0.27 0.15 0.05"/> </geometry>
+      <material name="gray"/>
+    </visual>
+  </link>
+  <joint name="chassis_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="chassis_link"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/> 
+  </joint>
+
+  <!-- ================= КОЛЕСА (Идеальная геометрия) ================= -->
+  <!-- Переднее Левое -->
+  <link name="wheel_fl_link">
+    <visual> <geometry> <cylinder radius="0.04" length="0.035"/> </geometry> <material name="black"/> </visual>
+  </link>
+  <joint name="wheel_fl_joint" type="fixed">
+    <parent link="base_link"/> <child link="wheel_fl_link"/>
+    <origin xyz="0.0825 0.109 0.04" rpy="1.5708 0 0"/>
+  </joint>
+
+  <!-- Переднее Правое -->
+  <link name="wheel_fr_link">
+    <visual> <geometry> <cylinder radius="0.04" length="0.035"/> </geometry> <material name="black"/> </visual>
+  </link>
+  <joint name="wheel_fr_joint" type="fixed">
+    <parent link="base_link"/> <child link="wheel_fr_link"/>
+    <origin xyz="0.0825 -0.109 0.04" rpy="1.5708 0 0"/>
+  </joint>
+
+  <!-- Заднее Левое -->
+  <link name="wheel_bl_link">
+    <visual> <geometry> <cylinder radius="0.04" length="0.035"/> </geometry> <material name="black"/> </visual>
+  </link>
+  <joint name="wheel_bl_joint" type="fixed">
+    <parent link="base_link"/> <child link="wheel_bl_link"/>
+    <origin xyz="-0.0825 0.109 0.04" rpy="1.5708 0 0"/>
+  </joint>
+
+  <!-- Заднее Правое -->
+  <link name="wheel_br_link">
+    <visual> <geometry> <cylinder radius="0.04" length="0.035"/> </geometry> <material name="black"/> </visual>
+  </link>
+  <joint name="wheel_br_joint" type="fixed">
+    <parent link="base_link"/> <child link="wheel_br_link"/>
+    <origin xyz="-0.0825 -0.109 0.04" rpy="1.5708 0 0"/>
+  </joint>
+
+  <!-- ================= ДАТЧИКИ ================= -->
+  <!-- Камера (На переднем бампере) -->
+  <link name="camera_link">
+    <visual> <geometry> <box size="0.04 0.04 0.03"/> </geometry> <material name="gray"/> </visual>
+  </link>
+  <joint name="camera_joint" type="fixed">
+    <parent link="chassis_link"/> <child link="camera_link"/>
+    <origin xyz="0.13 0 0.04" rpy="0 0 0"/> 
+  </joint>
+
+  <!-- Лидар (Смещен назад на 3.5см) -->
+  <link name="lidar_link">
+    <visual> <geometry> <cylinder radius="0.025" length="0.04"/> </geometry> <material name="blue"/> </visual>
+  </link>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="chassis_link"/> <child link="lidar_link"/>
+    <origin xyz="-0.035 0 0.045" rpy="0 0 0"/> 
+  </joint>
+
+  <!-- IMU -->
+  <link name="imu_link">
+    <visual> <geometry> <box size="0.02 0.02 0.01"/> </geometry> <material name="blue"/> </visual>
+  </link>
+  <joint name="imu_joint" type="fixed">
+    <parent link="chassis_link"/> <child link="imu_link"/>
+    <origin xyz="-0.0125 0.03 0.03" rpy="0 0 0"/>
+  </joint>
+
+</robot>

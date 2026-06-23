@@ -1,0 +1,8 @@
+float32 vx
+float32 vy
+float32 omega
+float32 duration
+---
+bool success
+string status_message
+

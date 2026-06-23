@@ -1,0 +1,11 @@
+mock_moebius_maze:
+  ros__parameters:
+    initial_pose: [1.5, 2.5, 0.0]
+    maze_map: [
+      "#########",
+      "#       #",
+      "#       #",
+      "#  # #  #",
+      "#       #",
+      "#########"
+    ]
