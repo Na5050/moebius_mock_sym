@@ -25,7 +25,7 @@ from rclpy.node import Node
 from std_msgs.msg import Empty
 from std_srvs.srv import Trigger
 #import time
-
+import threading
 from ifra_mol_1.srv import AutopilotTime, AutopilotRelative
 from ifra_mol_1.msg import AutopilotTelemetry
 
@@ -54,12 +54,31 @@ class RobotDriver(Node):
         # Телеметрия
         self._telemetry_sub = self.create_subscription(
             AutopilotTelemetry, '/autopilot/telemetry', self._on_telemetry, 10)
-        self._current_status = "IDLE"
-        self._current_x = self._current_y = self._current_yaw = 0.0
-        self._has_telemetry = False
 
         # Heartbeat
         self._hb_pub = self.create_publisher(Empty, '/autopilot/heartbeat', 10)
+
+        # Blackboard — единая потокобезопасная память
+        self.bb = Blackboard()
+        self.bb.update(
+            current_status="IDLE",
+            current_x=0.0, current_y=0.0, current_yaw=0.0,
+            has_telemetry=False,
+            lidar_ranges=[],
+            lidar_angle_min=0.0, lidar_angle_increment=0.0,
+            lidar_ready=False,
+            lidar_offset_x=0.0, lidar_offset_y=0.0,
+            lidar_offset_ready=False,
+            tf_tree={},
+            last_frame=None,
+            camera_ready=False,
+            line_offset=0.0, line_angle=0.0, line_detected=False,
+            object_x=0.0, object_y=0.0, object_detected=False,
+            marker_ids=[], marker_poses={}, markers_detected=False,
+            flow_dx=0.0, flow_dy=0.0, flow_ready=False,
+            detections=[], detections_ready=False,
+            extra_nodes=[],
+        )
 
         # Сенсоры
         self._init_lidar()
@@ -116,7 +135,7 @@ class RobotDriver(Node):
         if not self._active:
             print(f"\nРобот готов к миссии '{self.__class__.__name__}'.")
             input("Нажмите Enter для старта...")
-            self.get_logger().info(f"Лидар offset: x={self._lidar_offset_x:.3f}, y={self._lidar_offset_y:.3f}, ready={self._lidar_offset_ready}")
+            self.get_logger().info(f"Лидар offset: x={self.bb.get('lidar_offset_x'):.3f}, y={self.bb.get('lidar_offset_y'):.3f}, ready={self.bb.get('lidar_offset_ready')}")
             self.get_logger().info("Запуск миссии...")
             self._active = True
             return
@@ -145,37 +164,55 @@ class RobotDriver(Node):
 
     @staticmethod
     def spin(node: 'RobotDriver'):
+        """Запуск с многопоточным исполнителем."""
+        executor = rclpy.executors.MultiThreadedExecutor()
+        executor.add_node(node)
+        for extra in node.bb.get('extra_nodes', []):
+            executor.add_node(extra)
         try:
-            rclpy.spin(node)
+            executor.spin()
         except KeyboardInterrupt:
             pass
         finally:
-            try:
-                node.destroy_node()
-            except Exception:
-                pass
+            executor.shutdown()
+            node.destroy_node()
+            for extra in node.bb.get('extra_nodes', []):
+                extra.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
+
+    def add_node(self, node):
+        """Добавить узел в пул параллельного выполнения."""
+        nodes = self.bb.get('extra_nodes', [])
+        nodes.append(node)
+        self.bb.set('extra_nodes', nodes)
+        self.get_logger().info(f"Добавлен узел: {node.get_name()}")
 
     # =====================================================================
     # ИНТЕРФЕЙС АВТОПИЛОТА
     # =====================================================================
 
     def _on_telemetry(self, msg: AutopilotTelemetry):
-        self._current_status = msg.status
-        self._current_x = msg.x
-        self._current_y = msg.y
-        self._current_yaw = msg.yaw
-        self._has_telemetry = True
+        self.bb.update(
+            current_status=msg.status,
+            current_x=msg.x,
+            current_y=msg.y,
+            current_yaw=msg.yaw,
+            has_telemetry=True,
+        )
 
     def get_status(self) -> str:
-        return self._current_status
+        return self.bb.get('current_status', "IDLE")
 
     def get_pose(self) -> tuple:
-        return (self._current_x, self._current_y, self._current_yaw)
+        return (
+            self.bb.get('current_x', 0.0),
+            self.bb.get('current_y', 0.0),
+            self.bb.get('current_yaw', 0.0),
+        )
 
     def is_connected(self) -> bool:
-        return self._has_telemetry
+        return self.bb.get('has_telemetry', False)
 
     def send_heartbeat(self):
         self._hb_pub.publish(Empty())
@@ -205,22 +242,10 @@ class RobotDriver(Node):
 
     def _init_lidar(self):
         from sensor_msgs.msg import LaserScan
-        from tf2_ros import Buffer, TransformListener
-        self._lidar_ranges = []
-        self._lidar_angle_min = 0.0
-        self._lidar_angle_increment = 0.0
-        self._tf_tree = {}
-        self._lidar_offset_ready = False
-        self._lidar_ready = False
-        self._lidar_offset_x = 0.0
-        self._lidar_offset_y = 0.0
-        self._lidar_offset_ready = False
-        self._tf_buffer = None
-        self._tf_listener = None
         self.create_subscription(LaserScan, '/scan', self._on_lidar, 10)
 
     def _update_lidar_offset(self):
-        if self._lidar_offset_ready or hasattr(self, '_tf_static_sub'):
+        if self.bb.get('lidar_offset_ready') or hasattr(self, '_tf_static_sub'):
             return
         try:
             from tf2_msgs.msg import TFMessage
@@ -239,84 +264,88 @@ class RobotDriver(Node):
             self.get_logger().warn(f"Не удалось подписаться на /tf_static: {e}")
 
     def _on_tf_static(self, msg):
-        if self._lidar_offset_ready:
+        if self.bb.get('lidar_offset_ready'):
             return
 
+        tf_tree = self.bb.get('tf_tree')
         for t in msg.transforms:
-            self._tf_tree[t.child_frame_id] = (t.header.frame_id, t.transform.translation.x, t.transform.translation.y)
+            tf_tree[t.child_frame_id] = (t.header.frame_id, t.transform.translation.x, t.transform.translation.y)
+        self.bb.set('tf_tree', tf_tree)
 
-        if 'lidar_link' in self._tf_tree:
+        if 'lidar_link' in tf_tree:
             x, y = 0.0, 0.0
             frame = 'lidar_link'
             max_depth = 20
             depth = 0
 
-            while frame in self._tf_tree and depth < max_depth:
+            while frame in tf_tree and depth < max_depth:
                 depth += 1
-                parent, dx, dy = self._tf_tree[frame]
+                parent, dx, dy = tf_tree[frame]
                 x += dx
                 y += dy
                 frame = parent
 
                 if frame == 'base_link':
-                    self._lidar_offset_x = x
-                    self._lidar_offset_y = y
-                    self._lidar_offset_ready = True
+                    self.bb.update(lidar_offset_x=x, lidar_offset_y=y, lidar_offset_ready=True)
                     self.get_logger().info(f"Лидар смещён: x={x:.3f}, y={y:.3f}")
                     self.destroy_subscription(self._tf_static_sub)
                     return
 
     def _transform_lidar_distance(self, angle_rad: float, measured: float) -> float:
-        if measured >= float('inf') or not self._lidar_offset_ready:
+        if measured >= float('inf') or not self.bb.get('lidar_offset_ready'):
             return measured
-        offset_proj = self._lidar_offset_x * math.cos(angle_rad) + self._lidar_offset_y * math.sin(angle_rad)
+        offset_proj = self.bb.get('lidar_offset_x') * math.cos(angle_rad) + self.bb.get('lidar_offset_y') * math.sin(angle_rad)
         return max(0.0, measured - offset_proj)
 
     def _on_lidar(self, msg):
-        self._lidar_ranges = list(msg.ranges)
-        if not self._lidar_ready:
-            self._lidar_angle_min = msg.angle_min
-            self._lidar_angle_increment = msg.angle_increment
-            self._lidar_ready = True
+        self.bb.update(
+            lidar_ranges=list(msg.ranges),
+        )
+        if not self.bb.get('lidar_ready'):
+            self.bb.update(
+                lidar_angle_min=msg.angle_min,
+                lidar_angle_increment=msg.angle_increment,
+                lidar_ready=True,
+            )
         self._update_lidar_offset()
 
     def get_lidar_ranges(self) -> list:
         """Вернуть сырой массив замеров лидара."""
-        return self._lidar_ranges
+        return self.bb.get('lidar_ranges')
 
     def get_lidar_angle_min(self) -> float:
         """Минимальный угол лидара (радиан)."""
-        return self._lidar_angle_min
+        return self.bb.get('lidar_angle_min')
 
     def get_lidar_angle_increment(self) -> float:
         """Шаг угла лидара (радиан)."""
-        return self._lidar_angle_increment
+        return self.bb.get('lidar_angle_increment')
 
     def _lidar_index(self, angle_rad: float) -> int:
-        while angle_rad < self._lidar_angle_min:
+        while angle_rad < self.bb.get('lidar_angle_min'):
             angle_rad += 2 * math.pi
-        while angle_rad >= self._lidar_angle_min + 2 * math.pi:
+        while angle_rad >= self.bb.get('lidar_angle_min') + 2 * math.pi:
             angle_rad -= 2 * math.pi
-        return int((angle_rad - self._lidar_angle_min) / self._lidar_angle_increment)
+        return int((angle_rad - self.bb.get('lidar_angle_min')) / self.bb.get('lidar_angle_increment'))
 
     def _lidar_distance_at(self, angle_rad: float, default=float('inf')) -> float:
-        if not self._lidar_ready:
+        if not self.bb.get('lidar_ready'):
             return default
         idx = self._lidar_index(angle_rad)
-        if 0 <= idx < len(self._lidar_ranges):
-            val = self._lidar_ranges[idx]
+        if 0 <= idx < len(self.bb.get('lidar_ranges')):
+            val = self.bb.get('lidar_ranges')[idx]
             return val if val > 0.01 else default
         return default
 
     def _lidar_min_in_range(self, start_rad: float, end_rad: float) -> float:
-        if not self._lidar_ready:
+        if not self.bb.get('lidar_ready'):
             return float('inf')
         start_idx = self._lidar_index(start_rad)
         end_idx = self._lidar_index(end_rad) + 1
         if start_idx <= end_idx:
-            vals = [v for v in self._lidar_ranges[start_idx:end_idx] if v > 0.01]
+            vals = [v for v in self.bb.get('lidar_ranges')[start_idx:end_idx] if v > 0.01]
         else:
-            vals = [v for v in self._lidar_ranges[start_idx:] + self._lidar_ranges[:end_idx] if v > 0.01]
+            vals = [v for v in self.bb.get('lidar_ranges')[start_idx:] + self.bb.get('lidar_ranges')[:end_idx] if v > 0.01]
         return min(vals) if vals else float('inf')
 
     def get_lidar_sector(self, center_rad: float, width_deg: float = 20.0) -> float:
@@ -342,9 +371,9 @@ class RobotDriver(Node):
         return self.get_lidar_sector(math.pi, width_deg)
 
     def get_lidar_min_distance(self) -> float:
-        if not self._lidar_ready:
+        if not self.bb.get('lidar_ready'):
             return float('inf')
-        vals = [v for v in self._lidar_ranges if v > 0.01]
+        vals = [v for v in self.bb.get('lidar_ranges') if v > 0.01]
         return self._transform_lidar_distance(0.0, min(vals)) if vals else float('inf')
 
     def get_lidar_sectors(self, front_width=30, side_width=20) -> dict:
@@ -364,29 +393,28 @@ class RobotDriver(Node):
         import cv2
         from cv_bridge import CvBridge
         self._cv_bridge = CvBridge()
-        self._last_frame = None
-        self._camera_ready = False
         self.create_subscription(Image, '/camera/image_raw', self._on_camera, 10)
 
     def _on_camera(self, msg):
         import cv2
         try:
-            self._last_frame = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            self._camera_ready = True
+            frame = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            self.bb.update(last_frame=frame, camera_ready=True)
         except Exception:
             pass
 
     def get_frame(self):
-        return self._last_frame
+        return self.bb.get('last_frame')
 
     def save_frame(self, filename: str = None) -> str:
         import cv2
-        if self._last_frame is None:
+        frame = self.bb.get('last_frame')
+        if frame is None:
             return ""
         if filename is None:
             from datetime import datetime
             filename = f"frame_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-        cv2.imwrite(filename, self._last_frame)
+        cv2.imwrite(filename, frame)
         self.get_logger().info(f"Кадр сохранён: {filename}")
         return filename
 
@@ -396,88 +424,60 @@ class RobotDriver(Node):
 
     def _init_vision(self):
         """Поля для результатов компьютерного зрения."""
-        # Детектирование линии
-        self._line_offset = 0.0
-        self._line_angle = 0.0
-        self._line_detected = False
-
-        # Трекинг объекта
-        self._object_x = 0.0
-        self._object_y = 0.0
-        self._object_detected = False
-
-        # ArUco-маркеры
-        self._marker_ids = []
-        self._marker_poses = {}
-        self._markers_detected = False
-
-        # Оптический поток
-        self._flow_dx = 0.0
-        self._flow_dy = 0.0
-        self._flow_ready = False
+        pass
 
     def set_line_info(self, offset: float, angle: float, detected: bool = True):
-        self._line_offset = offset
-        self._line_angle = angle
-        self._line_detected = detected
+        self.bb.update(line_offset=offset, line_angle=angle, line_detected=detected)
 
     def get_line_position(self) -> tuple:
-        return (self._line_offset, self._line_angle, self._line_detected)
+        return (self.bb.get('line_offset', 0.0), self.bb.get('line_angle', 0.0), self.bb.get('line_detected', False))
 
     def set_object_position(self, x: float, y: float, detected: bool = True):
-        self._object_x = x
-        self._object_y = y
-        self._object_detected = detected
+        self.bb.update(object_x=x, object_y=y, object_detected=detected)
 
     def get_object_position(self) -> tuple:
-        return (self._object_x, self._object_y, self._object_detected)
+        return (self.bb.get('object_x', 0.0), self.bb.get('object_y', 0.0), self.bb.get('object_detected', False))
 
     def set_marker_info(self, ids: list, poses: dict):
-        self._marker_ids = ids
-        self._marker_poses = poses
-        self._markers_detected = len(ids) > 0
+        self.bb.update(marker_ids=ids, marker_poses=poses, markers_detected=len(ids) > 0)
 
     def get_marker_info(self) -> tuple:
-        return (self._marker_ids, self._marker_poses, self._markers_detected)
+        return (self.bb.get('marker_ids', []), self.bb.get('marker_poses', {}), self.bb.get('markers_detected', False))
 
     def get_marker_id(self):
-        return self._marker_ids[0] if self._marker_ids else None
+        ids = self.bb.get('marker_ids', [])
+        return ids[0] if ids else None
 
     def set_optical_flow(self, dx: float, dy: float):
-        self._flow_dx = dx
-        self._flow_dy = dy
-        self._flow_ready = True
+        self.bb.update(flow_dx=dx, flow_dy=dy, flow_ready=True)
 
     def get_optical_flow(self) -> tuple:
-        return (self._flow_dx, self._flow_dy, self._flow_ready)
+        return (self.bb.get('flow_dx', 0.0), self.bb.get('flow_dy', 0.0), self.bb.get('flow_ready', False))
 
     # =====================================================================
     # СЕНСОРЫ: НЕЙРОСЕТИ (PyTorch / Hailo-8)
     # =====================================================================
 
     def _init_neural(self):
-        """Поля для результатов нейросетевого детектирования."""
-        self._detections = []          # [(class_name, confidence, x1, y1, x2, y2), ...]
-        self._detections_ready = False
+        pass
 
     def set_detections(self, detections: list):
-        self._detections = detections
-        self._detections_ready = True
+        self.bb.update(detections=detections, detections_ready=True)
 
     def get_detections(self) -> list:
-        return self._detections
+        return self.bb.get('detections', [])
 
     def has_detections(self) -> bool:
-        return self._detections_ready and len(self._detections) > 0
+        return self.bb.get('detections_ready', False) and len(self.bb.get('detections', [])) > 0
 
     def is_class_detected(self, class_name: str) -> bool:
-        return any(d[0] == class_name for d in self._detections)
+        return any(d[0] == class_name for d in self.bb.get('detections', []))
 
     def is_person_detected(self) -> bool:
         return self.is_class_detected("person")
 
     def get_detections_by_class(self, class_name: str) -> list:
-        return [d for d in self._detections if d[0] == class_name]
+        return [d for d in self.bb.get('detections', []) if d[0] == class_name]
 
 # ==============================================================================
 # 2. ЯДРО ДЕРЕВА ПОВЕДЕНИЯ
@@ -1152,33 +1152,41 @@ class TimerAction(BTNode):
 # ==============================================================================
 
 class Blackboard:
-    """
-    Общая память дерева поведения.
-    Позволяет узлам обмениваться данными без засорения RobotDriver.
-    """
+    """Потокобезопасная общая память."""
 
     def __init__(self):
         self._data = {}
+        self._lock = threading.Lock()
 
     def set(self, key: str, value):
-        self._data[key] = value
+        with self._lock:
+            self._data[key] = value
 
     def get(self, key: str, default=None):
-        return self._data.get(key, default)
+        with self._lock:
+            return self._data.get(key, default)
 
     def has(self, key: str) -> bool:
-        return key in self._data
+        with self._lock:
+            return key in self._data
 
     def delete(self, key: str):
-        if key in self._data:
-            del self._data[key]
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
 
     def clear(self):
-        self._data.clear()
+        with self._lock:
+            self._data.clear()
 
     def all(self) -> dict:
-        return dict(self._data)
+        with self._lock:
+            return dict(self._data)
 
+    def update(self, **kwargs):
+        """Потокобезопасное обновление нескольких ключей."""
+        with self._lock:
+            self._data.update(kwargs)
 
 # ==============================================================================
 # 3.3 SUBTREE — переиспользуемый фрагмент дерева
