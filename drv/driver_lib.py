@@ -28,7 +28,123 @@ from std_srvs.srv import Trigger
 import threading
 from ifra_mol_1.srv import AutopilotTime, AutopilotRelative
 from ifra_mol_1.msg import AutopilotTelemetry
+import socket
+import http.server
+import socketserver
+from itertools import count
 
+class ImageProcessorNode(Node):
+    """Базовый узел обработки изображений. Наследуй и переопредели process_frame()."""
+    
+    _counter = count(1)
+
+    def __init__(self, driver, fps=30, node_name=None):
+        if node_name is None:
+            node_name = f'image_processor_{next(ImageProcessorNode._counter)}'
+        super().__init__(node_name)
+        
+        self.driver = driver
+        self._busy = False
+        # Используем встроенный таймер ROS2
+        self._timer = self.create_timer(1.0 / fps, self._process)
+        self.get_logger().info(f"{node_name} готов ({fps} FPS)")
+
+    def _process(self):
+        # Если прошлый кадр еще обрабатывается, пропускаем текущий тик таймера
+        if self._busy:
+            return
+            
+        frame = self.driver.get_frame()
+        if frame is None or frame.size == 0:
+            return
+
+        self._busy = True
+        try:
+            self.process_frame(frame)
+        except Exception as e:
+            self.get_logger().error(f"Ошибка обработки кадра: {e}")
+        finally:
+            self._busy = False
+
+    def process_frame(self, frame):
+        """Переопредели в наследнике. frame — numpy array BGR."""
+        raise NotImplementedError("Переопредели process_frame(frame)")
+
+class HttpStreamerNode(Node):
+    """HTTP видеопоток. Стримит JPEG из bb[key]."""
+    _counter = 0
+    def __init__(self, bb, key='stream_jpeg', port=8080, fps=30, node_name=None):
+        if node_name is None:
+            HttpStreamerNode._counter += 1
+            node_name = f'http_streamer_{HttpStreamerNode._counter}'
+        # Исправлено: передаем сгенерированный node_name в super().__init__
+        super().__init__(node_name)
+        self._bb = bb
+        self._key = key
+        self._httpd = None
+        self._period = 1.0 / fps
+        self._running = True # Флаг для остановки внутренних циклов клиентов
+        self._start_server(port)
+        self.get_logger().info(f"HTTP стример bb['{key}'] на http://localhost:{port} ({fps} FPS)")
+
+    def _start_server(self, port):
+        bb = self._bb
+        key = self._key
+        period = self._period
+        node = self # Ссылка на саму ноду, чтобы проверять флаг остановки
+        from time import sleep 
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == '/' or self.path == '/stream':
+                    self.send_response(200)
+                    self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+                    self.end_headers()
+                    # Исправлено: проверяем флаг ноды node._running, чтобы выйти при дестрое
+                    while node._running:
+                        frame = bb.get(key)
+                        if frame is not None:
+                            try:
+                                self.wfile.write(b'--frame\r\n')
+                                self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                                self.wfile.write(frame)
+                                self.wfile.write(b'\r\n')
+                            except (BrokenPipeError, ConnectionResetError, Exception):
+                                break
+                        sleep(period) 
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        # Исправлено: разрешаем повторное использование порта ДО создания сервера
+        socketserver.TCPServer.allow_reuse_address = True
+        self._httpd = socketserver.TCPServer(('0.0.0.0', port), Handler)
+        
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+
+    def destroy_node(self):
+        # 1. Меняем флаг, чтобы завершить отправку кадров во всех активных HTTP-клиентах
+        self._running = False
+        
+        if self._httpd:
+            # 2. Останавливаем цикл serve_forever фонового потока
+            self._httpd.shutdown()
+            # 3. Закрываем слушающий сокет
+            self._httpd.server_close()
+            self.get_logger().info("HTTP стример остановлен, порт свободен")
+            
+        super().destroy_node()
+
+
+# Линия на :8080
+#self.add_node(HttpStreamerNode(self.bb, key='stream_jpeg', port=8080))
+# Каналы на :8081
+#self.add_node(HttpStreamerNode(self.bb, key='channel_r', port=8081))
+# HSV на :8082
+#self.add_node(HttpStreamerNode(self.bb, key='hsv_jpeg', port=8082))
 
 # ==============================================================================
 # 1. БАЗОВЫЙ КЛАСС-КЛИЕНТ АВТОПИЛОТА (DRIVER)
