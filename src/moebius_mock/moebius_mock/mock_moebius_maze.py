@@ -27,7 +27,8 @@ loadPrcFileData("", "notify-level-device error")
 
 from direct.showbase.ShowBase import ShowBase
 from cv_bridge import CvBridge
-
+# --- ГЛОБАЛЬНЫЕ КОНСТАНТЫ СИМУЛЯТОРА ---
+ARUCO_BOX_THICKNESS = 0.05  # Толщина маркерной коробки: ровно 5 см
 class PandaRenderer(ShowBase):
     # Разрешение подложки пола: 512 пикселей на 1 метр лабиринта (1 пиксель = 2 мм)
     SCALE_M_TO_PX = 512.0
@@ -120,21 +121,32 @@ class PandaRenderer(ShowBase):
         floor_node.setZ(0.0) 
 
         # --- 2. РЕНДЕРИНГ ТОЛСТЫХ ОБЪЕМНЫХ КУБОВ СТЕН 1х1х1 МЕТР ---
+        # --- 2. ДИНАМИЧЕСКИЙ РЕНДЕРИНГ ВСЕХ СТЕН И МАРКЕРНЫХ КОРОБОК ИЗ MASSIBA WALLS ---
         for wall in walls:
             w_x1, w_x2, w_y1, w_y2 = wall
             
-            # Фильтруем только оригинальные блоки лабиринта 1х1м
-            if math.isclose(w_x2 - w_x1, 1.0) and math.isclose(w_y2 - w_y1, 1.0):
-                cx = w_x1 + 0.5
-                cy = w_y1 + 0.5
-
-                # Загружаем сплошной 3D-меш куба из встроенных ресурсов Panda3D
-                wall_cube = self.loader.loadModel("box")
-                wall_cube.reparentTo(self.render)
-                
-                # Смещаем куб на -0.5 по X и Y от центра ячейки cx/cy, чтобы компенсировать его угловой origin
-                wall_cube.setPos(cx - 0.5, cy - 0.5, 0.0) 
-                wall_cube.setColor(0.0, 0.6, 0.6, 1) # Яркий бирюзовый Gazebo Classic
+            # Вычисляем честные физические размеры преграды, запеченной в walls
+            # (Для стен лабиринта тут будет 1.0, для ArUco-коробок — 0.05 по одной оси и box_w по другой)
+            dx = abs(w_x2 - w_x1)
+            dy = abs(w_y2 - w_y1)
+            
+            # Загружаем базовый 3D-меш куба из встроенных ресурсов Panda3D (размер по умолчанию 1х1х1м)
+            wall_cube = self.loader.loadModel("box")
+            wall_cube.reparentTo(self.render)
+            
+            # ЖЕЛЕЗНОЕ ИСПРАВЛЕНИЕ МАСШТАБА:
+            # Динамически растягиваем куб под честные размеры преграды.
+            # По осям X и Y передаем вычисленные дельты dx и dy. 
+            # По оси Z (высота) жестко ставим 1.0 метр для стен лабиринта, 
+            # либо можешь привязать к высоте маркера, но оставим 1.0 для монолитности.
+            wall_cube.setScale(dx, dy, 1.0)
+            
+            # Ставим куб строго в левый нижний угол его математической ячейки (w_x1, w_y1) на уровень пола (Z=0.0)
+            # Благодаря setScale, куб аккуратно вырастет точно до границ w_x2 и w_y2!
+            wall_cube.setPos(w_x1, w_y1, 0.0)
+            
+            # Красим все физические преграды Лидара в фирменный бирюзовый цвет Gazebo Classic
+            wall_cube.setColor(0.0, 0.6, 0.6, 1)
 
         # Размещение знаков на передних гранях толстых кубов
         for (mx, my), symbol in sign_zones.items():
@@ -156,24 +168,30 @@ class PandaRenderer(ShowBase):
                 elif symbol == 'L': sign_box.setColor(0, 0, 1, 1)
                 elif symbol == 'R': sign_box.setColor(0, 1, 0, 1)
 
-        # 3. НАКЛЕИВАНИЕ ARUCO-МАРКЕРОВ НА ЧЕСТНЫЕ ВНЕШНИЕ ГРАНИ (БЕЗ ROS_Y И ПЕРЕВОРОТОВ)
+        # --- 3. НАКЛЕИВАНИЕ ARUCO-МАРКЕРОВ НА ВНЕШНИЕ ГРАНИ ТОНКИХ КУБОВ (ЧЕРЕЗ МОДУЛЬНУЮ ТОЛЩИНУ) ---
         try:
             aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
             for i in range(0, len(aruco_markers), 4):
                 ax, ay, side_idx, aid = aruco_markers[i:i+4]
                 side = int(side_idx) % 4
                 
-                # ЧИСТАЯ ПРЯМАЯ ГЕОМЕТРИЯ:
-                # Координаты ay и ax берутся напрямую из YAML как левый нижний угол куба 1х1м
+                # Координаты опорного угла из YAML
                 w_x1 = float(int(ax))
                 w_y1 = float(int(ay))
-                w_x2 = w_x1 + 1.0
-                w_y2 = w_y1 + 1.0
 
-                # Генерация текстуры ArUco маркера
+                # Рассчитываем геометрию на основе глобальной константы из модуля
+                box_width = aruco_w + 0.10
+                half_box_w = box_width / 2.0
+                half_th = ARUCO_BOX_THICKNESS / 2.0
+                
+                # Микроскопический отступ (1 миллиметр), чтобы наклейка не сливалась со стенкой
+                gap = 0.001 
+
+                # Генерируем ArUco маркер с исправлением инверсии цветов
                 m_img = cv2.aruco.generateImageMarker(aruco_dict, id=int(aid), sidePixels=256)
-                m_img = cv2.bitwise_not(m_img)
+                m_img = cv2.bitwise_not(m_img) 
                 m_rgb = cv2.cvtColor(m_img, cv2.COLOR_GRAY2RGB)
+                
                 pil_m = PILImage.fromarray(m_rgb)
                 m_tex = Texture()
                 m_tex.setup2dTexture(256, 256, Texture.T_unsigned_byte, Texture.F_rgb)
@@ -184,25 +202,33 @@ class PandaRenderer(ShowBase):
                 sticker = self.render.attachNewNode(cm_m.generate())
                 sticker.setTexture(m_tex, 1)
 
-                # Высота центра наклейки над полом
-                z_pos = aruco_h / 2.0 + 0.2
+                z_pos = 0.5  # Центр по высоте
 
-                # Наклеивание строго на внешние плоскости с сантиметровым отступом (+0.01) от Z-fighting
-                if side == 0:    # 0 -> Смотрит вправо (Наклейка на правой дальней грани по X: X = w_x2)
-                    sticker.setPos(w_x2 + 0.01, w_y1 + 0.5, z_pos)
+                # МАТЕМАТИЧЕСКИ ИДЕАЛЬНОЕ СОВПАДЕНИЕ С ЗАПЕКАНИЕМ:
+                # Наклейка выносится ровно на внешнюю плоскость бирюзовой преграды (half_th + gap)
+                if side == 0:    # 0 -> Смотрит вправо
+                    bx = w_x1 + half_th
+                    by = w_y1 + half_box_w
+                    sticker.setPos(bx + half_th + gap, by, z_pos)
                     sticker.setHpr(90, 0, 0)
-                elif side == 1:  # 1 -> Смотрит вперед (Наклейка на верхней дальней грани по Y: Y = w_y2)
-                    sticker.setPos(w_x1 + 0.5, w_y2 + 0.01, z_pos)
+                elif side == 1:  # 1 -> Смотрит вперед
+                    bx = w_x1 + half_box_w
+                    by = w_y1 + half_th
+                    sticker.setPos(bx, by + half_th + gap, z_pos)
                     sticker.setHpr(180, 0, 0)
-                elif side == 2:  # 2 -> Смотрит влево (Наклейка на левой ближней грани по X: X = w_x1)
-                    sticker.setPos(w_x1 - 0.01, w_y1 + 0.5, z_pos)
+                elif side == 2:  # 2 -> Смотрит влево
+                    bx = w_x1 - half_th
+                    by = w_y1 + half_box_w
+                    sticker.setPos(bx - half_th - gap, by, z_pos)
                     sticker.setHpr(-90, 0, 0)
-                elif side == 3:  # 3 -> Смотрит назад (Наклейка на нижней ближней грани по Y: Y = w_y1)
-                    sticker.setPos(w_x1 + 0.5, w_y1 - 0.01, z_pos)
+                elif side == 3:  # 3 -> Смотрит назад
+                    bx = w_x1 + half_box_w
+                    by = w_y1 - half_th
+                    sticker.setPos(bx, by - half_th - gap, z_pos)
                     sticker.setHpr(0, 0, 0)
                     
         except Exception as e:
-            print(f"Ошибка 3D-рендеринга ArUco: {e}")
+            print(f"Ошибка 3D-рендеринга наклеек ArUco: {e}")
 
 class MockMoebiusMaze(Node):
     def __init__(self):
@@ -272,21 +298,42 @@ class MockMoebiusMaze(Node):
         sign_h = self.get_parameter('sign_height').get_parameter_value().double_value
         aruco_w = self.get_parameter('aruco_width').get_parameter_value().double_value
         aruco_h = self.get_parameter('aruco_height').get_parameter_value().double_value
+        #ARUCO_BOX_THICKNESS = 0.05
 
         # 2. ОСТОРОЖНОЕ ЗАПЕКАНИЕ: дописываем кубы ArUco-маркеров как полноценные жесткие кубы 1х1м
         # Координаты ay принудительно инвертируем (maze_height - 1 - ay), чтобы они совпали с сеткой ROS 2!
         for i in range(0, len(aruco_mk), 4):
-            ax_raw, ay_raw, side_idx, aid = aruco_mk[i:i+4]
+            ax, ay, side_idx, aid = aruco_mk[i:i+4]
+            side = int(side_idx) % 4
             
-            # Принудительно приводим координаты к int, гарантируя попадание ровно в сетку шага 1 метр
-            ax = int(ax_raw)
-            ay = int(ay_raw)
-            
-            # Инвертируем Y под мировую ROS-сетку лабиринта, точно так же, как для обычных стен выше
-            #ros_y = float(self.maze_height - 1 - ay) 
-            
-            # Добавляем честный жесткий куб 1х1 метр [x1, x2, y1, y2]
-            walls.append([float(ax), float(ax) + 1.0, float(ay), float(ay) + 1.0])
+            # Координаты левого нижнего угла куба лабиринта, к которому привязан маркер
+            w_x1 = float(int(ax))
+            w_y1 = float(int(ay))
+            w_x2 = w_x1
+            w_y2 = w_y1
+
+            # Ширина коробки-подложки: размер маркера + 5 см с каждой стороны (+10 см всего)
+            box_width = aruco_w + 0.10
+            half_box_w = box_width / 2.0
+            half_th = ARUCO_BOX_THICKNESS / 2.0
+
+            # Математический расчет ортогональных границ [x1, x2, y1, y2] для Лидара и физики
+            if side == 0:    # 0 -> Смотрит вправо (Прижата к правой грани куба w_x2)
+                cx = w_x2 + half_th
+                cy = w_y1 + half_box_w
+                walls.append([cx - half_th, cx + half_th, cy - half_box_w, cy + half_box_w])
+            elif side == 1:  # 1 -> Смотрит вперед (Прижата к дальней грани куба w_y2)
+                cx = w_x1 + half_box_w
+                cy = w_y2 + half_th
+                walls.append([cx - half_box_w, cx + half_box_w, cy - half_th, cy + half_th])
+            elif side == 2:  # 2 -> Смотрит влево (Прижата к левой грани куба w_x1)
+                cx = w_x1 - half_th
+                cy = w_y1 + half_box_w
+                walls.append([cx - half_th, cx + half_th, cy - half_box_w, cy + half_box_w])
+            elif side == 3:  # 3 -> Смотрит назад (Прижата к ближней грани куба w_y1)
+                cx = w_x1 + half_box_w
+                cy = w_y1 - half_th
+                walls.append([cx - half_box_w, cx + half_box_w, cy - half_th, cy + half_th])
 
         self.walls = np.array(walls, dtype=np.float64)
         # Скорости Moebius
