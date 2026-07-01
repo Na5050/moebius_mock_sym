@@ -156,18 +156,23 @@ class PandaRenderer(ShowBase):
                 elif symbol == 'L': sign_box.setColor(0, 0, 1, 1)
                 elif symbol == 'R': sign_box.setColor(0, 1, 0, 1)
 
-        # --- 3. НАКЛЕИВАНИЕ ARUCO-МАРКЕРОВ НА ОРТОГОНАЛЬНЫЕ ГРАНИ ТОЛСТЫХ КУБОВ ---
+        # 3. НАКЛЕИВАНИЕ ARUCO-МАРКЕРОВ НА ЧЕСТНЫЕ ВНЕШНИЕ ГРАНИ (БЕЗ ROS_Y И ПЕРЕВОРОТОВ)
         try:
             aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
             for i in range(0, len(aruco_markers), 4):
                 ax, ay, side_idx, aid = aruco_markers[i:i+4]
                 side = int(side_idx) % 4
                 
-                ros_y = float(maze_height - 1 - int(ay))
-                w_x1, w_x2 = float(ax), float(ax) + 1.0
-                w_y1, w_y2 = ros_y, ros_y + 1.0
+                # ЧИСТАЯ ПРЯМАЯ ГЕОМЕТРИЯ:
+                # Координаты ay и ax берутся напрямую из YAML как левый нижний угол куба 1х1м
+                w_x1 = float(int(ax))
+                w_y1 = float(int(ay))
+                w_x2 = w_x1 + 1.0
+                w_y2 = w_y1 + 1.0
 
+                # Генерация текстуры ArUco маркера
                 m_img = cv2.aruco.generateImageMarker(aruco_dict, id=int(aid), sidePixels=256)
+                m_img = cv2.bitwise_not(m_img)
                 m_rgb = cv2.cvtColor(m_img, cv2.COLOR_GRAY2RGB)
                 pil_m = PILImage.fromarray(m_rgb)
                 m_tex = Texture()
@@ -179,19 +184,23 @@ class PandaRenderer(ShowBase):
                 sticker = self.render.attachNewNode(cm_m.generate())
                 sticker.setTexture(m_tex, 1)
 
-                # Выравнивание по граням куба 1х1 метр (смещение 0.005 от визуального мерцания полигонов)
-                if side == 0:    # 0 -> Смотрит вправо (Грань w_x2)
-                    sticker.setPos(w_x2 + 0.005, w_y1 + 0.5, aruco_h / 2.0)
+                # Высота центра наклейки над полом
+                z_pos = aruco_h / 2.0 + 0.2
+
+                # Наклеивание строго на внешние плоскости с сантиметровым отступом (+0.01) от Z-fighting
+                if side == 0:    # 0 -> Смотрит вправо (Наклейка на правой дальней грани по X: X = w_x2)
+                    sticker.setPos(w_x2 + 0.01, w_y1 + 0.5, z_pos)
                     sticker.setHpr(90, 0, 0)
-                elif side == 1:  # 1 -> Смотрит вперед (Грань w_y2)
-                    sticker.setPos(w_x1 + 0.5, w_y2 + 0.005, aruco_h / 2.0)
+                elif side == 1:  # 1 -> Смотрит вперед (Наклейка на верхней дальней грани по Y: Y = w_y2)
+                    sticker.setPos(w_x1 + 0.5, w_y2 + 0.01, z_pos)
                     sticker.setHpr(180, 0, 0)
-                elif side == 2:  # 2 -> Смотрит влево (Грань w_x1)
-                    sticker.setPos(w_x1 - 0.005, w_y1 + 0.5, aruco_h / 2.0)
+                elif side == 2:  # 2 -> Смотрит влево (Наклейка на левой ближней грани по X: X = w_x1)
+                    sticker.setPos(w_x1 - 0.01, w_y1 + 0.5, z_pos)
                     sticker.setHpr(-90, 0, 0)
-                elif side == 3:  # 3 -> Смотрит назад (Грань w_y1)
-                    sticker.setPos(w_x1 + 0.5, w_y1 - 0.005, aruco_h / 2.0)
+                elif side == 3:  # 3 -> Смотрит назад (Наклейка на нижней ближней грани по Y: Y = w_y1)
+                    sticker.setPos(w_x1 + 0.5, w_y1 - 0.01, z_pos)
                     sticker.setHpr(0, 0, 0)
+                    
         except Exception as e:
             print(f"Ошибка 3D-рендеринга ArUco: {e}")
 
@@ -245,6 +254,39 @@ class MockMoebiusMaze(Node):
                     # Если это буква знака, запоминаем её позицию
                     if symbol != '#':
                         self.sign_zones[(x, y)] = symbol
+
+        # --- ИНИЦИАЛИЗАЦИЯ 3D-ДВИЖОК ПО ОРИГИНАЛЬНОМУ SELF.WALLS ---
+        self.declare_parameter('line_points', [1.5, 1.5, 2.5, 1.5])
+        self.declare_parameter('sign_width', 0.3)
+        self.declare_parameter('sign_height', 0.3)
+        self.declare_parameter('aruco_width', 0.4)
+        self.declare_parameter('aruco_height', 0.4)
+        self.declare_parameter('aruco_markers', [2.0, 2.0, 0.0, 42.0]) # Пока не внедряем в физику
+
+        self.bridge = CvBridge()
+
+        # Читаем параметры из YAML
+        line_pts = self.get_parameter('line_points').get_parameter_value().double_array_value
+        aruco_mk = self.get_parameter('aruco_markers').get_parameter_value().double_array_value
+        sign_w = self.get_parameter('sign_width').get_parameter_value().double_value
+        sign_h = self.get_parameter('sign_height').get_parameter_value().double_value
+        aruco_w = self.get_parameter('aruco_width').get_parameter_value().double_value
+        aruco_h = self.get_parameter('aruco_height').get_parameter_value().double_value
+
+        # 2. ОСТОРОЖНОЕ ЗАПЕКАНИЕ: дописываем кубы ArUco-маркеров как полноценные жесткие кубы 1х1м
+        # Координаты ay принудительно инвертируем (maze_height - 1 - ay), чтобы они совпали с сеткой ROS 2!
+        for i in range(0, len(aruco_mk), 4):
+            ax_raw, ay_raw, side_idx, aid = aruco_mk[i:i+4]
+            
+            # Принудительно приводим координаты к int, гарантируя попадание ровно в сетку шага 1 метр
+            ax = int(ax_raw)
+            ay = int(ay_raw)
+            
+            # Инвертируем Y под мировую ROS-сетку лабиринта, точно так же, как для обычных стен выше
+            #ros_y = float(self.maze_height - 1 - ay) 
+            
+            # Добавляем честный жесткий куб 1х1 метр [x1, x2, y1, y2]
+            walls.append([float(ax), float(ax) + 1.0, float(ay), float(ay) + 1.0])
 
         self.walls = np.array(walls, dtype=np.float64)
         # Скорости Moebius
@@ -300,24 +342,6 @@ class MockMoebiusMaze(Node):
         
         # Таймер для периодической публикации карты (например, раз в секунду)
         self.map_timer = self.create_timer(1.0, self.publish_map)
-
-        # --- ИНИЦИАЛИЗАЦИЯ 3D-ДВИЖОК ПО ОРИГИНАЛЬНОМУ SELF.WALLS ---
-        self.declare_parameter('line_points', [1.5, 1.5, 2.5, 1.5]) 
-        self.declare_parameter('sign_width', 0.3)
-        self.declare_parameter('sign_height', 0.3)
-        self.declare_parameter('aruco_width', 0.4)
-        self.declare_parameter('aruco_height', 0.4)
-        self.declare_parameter('aruco_markers', [2.0, 2.0, 0.0, 42.0]) # Пока не внедряем в физику
-
-        self.bridge = CvBridge()
-
-        # Читаем параметры из YAML
-        line_pts = self.get_parameter('line_points').get_parameter_value().double_array_value
-        aruco_mk = self.get_parameter('aruco_markers').get_parameter_value().double_array_value
-        sign_w = self.get_parameter('sign_width').get_parameter_value().double_value
-        sign_h = self.get_parameter('sign_height').get_parameter_value().double_value
-        aruco_w = self.get_parameter('aruco_width').get_parameter_value().double_value
-        aruco_h = self.get_parameter('aruco_height').get_parameter_value().double_value
 
         # Передаем оригинальный self.walls, созданный твоим кодом.
         self.renderer = PandaRenderer(
