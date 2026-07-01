@@ -176,8 +176,8 @@ class PandaRenderer(ShowBase):
                 side = int(side_idx) % 4
                 
                 # Координаты опорного угла из YAML
-                w_x1 = float(int(ax))
-                w_y1 = float(int(ay))
+                w_x1 = float(ax)
+                w_y1 = float(ay)
 
                 # Рассчитываем геометрию на основе глобальной константы из модуля
                 box_width = aruco_w + 0.10
@@ -307,8 +307,8 @@ class MockMoebiusMaze(Node):
             side = int(side_idx) % 4
             
             # Координаты левого нижнего угла куба лабиринта, к которому привязан маркер
-            w_x1 = float(int(ax))
-            w_y1 = float(int(ay))
+            w_x1 = float(ax)
+            w_y1 = float(ay)
             w_x2 = w_x1
             w_y2 = w_y1
 
@@ -376,14 +376,27 @@ class MockMoebiusMaze(Node):
         self.map_msg.info.origin.orientation.w = 1.0
         
         # Заполняем массив данных карты: 100 — стена (черный цвет), 0 — пусто (белый цвет)
+        # --- ЗАПОЛНЕНИЕ КАРТЫ С ВЫДЕЛЕНИЕМ ЗОН ARUCO СЕРЫМ ЦВЕТОМ (45) ---
         map_data = []
-        # Идем снизу вверх по мировой оси Y (от последней строки к первой)
         for y in reversed(range(self.maze_height)):
             for x in range(self.maze_width):
+                
+                # Проверяем, привязан ли к этой ячейке (x, y) ArUco-маркер из YAML
+                is_aruco_cell = False
+                for i in range(0, len(aruco_mk), 4):
+                    ax = int(aruco_mk[i])
+                    ay = int(self.maze_height-aruco_mk[i+1])
+                    if x == ax and y == ay:
+                        is_aruco_cell = True
+                        break
+                
+                # Присваиваем веса ячейкам для RViz2 /map
                 if self.maze[y][x] in ['#', 'S', 'L', 'R']:
-                    map_data.append(100) # Стена занята
+                    map_data.append(100) # Глухая стена лабиринта -> ЧЕРНЫЙ цвет
+                elif is_aruco_cell:
+                    map_data.append(45)  # Зона тонкого ArUco-щита -> СЕРЫЙ цвет
                 else:
-                    map_data.append(0)   # Свободная зона коридора
+                    map_data.append(0)   # Свободная зона коридора -> БЕЛЫЙ цвет
                     
         self.map_msg.data = map_data
         
