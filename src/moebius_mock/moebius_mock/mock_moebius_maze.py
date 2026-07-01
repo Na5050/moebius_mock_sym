@@ -7,8 +7,193 @@ from rosgraph_msgs.msg import Clock
 from builtin_interfaces.msg import Time
 from nav_msgs.msg import OccupancyGrid, MapMetaData
 import tf2_ros
+import os
 import math
 import numpy as np
+import cv2
+from PIL import Image as PILImage
+
+from panda3d.core import loadPrcFileData, DirectionalLight, Vec4, Texture, CardMaker, GraphicsOutput, FrameBufferProperties, WindowProperties, GraphicsPipe
+# Автовыбор GPU/CPU, скрытый офскрин-режим, отключение окон, теней, звука и устройств ввода
+loadPrcFileData("", "window-type offscreen")
+loadPrcFileData("", "audio-library none")
+loadPrcFileData("", "shadow-depth-bits 0")
+loadPrcFileData("", "framebuffer-multisample 0")
+loadPrcFileData("", "multisamples 0")
+loadPrcFileData("", "support-keyboard 0")
+loadPrcFileData("", "support-mouse 0")
+loadPrcFileData("", "notify-level fatal")
+loadPrcFileData("", "notify-level-device error")
+
+from direct.showbase.ShowBase import ShowBase
+from cv_bridge import CvBridge
+
+class PandaRenderer(ShowBase):
+    # Разрешение подложки пола: 512 пикселей на 1 метр лабиринта (1 пиксель = 2 мм)
+    SCALE_M_TO_PX = 512.0
+
+    def __init__(self, cam_w, cam_h, walls, sign_zones, maze_height, maze_width, line_points, aruco_markers, sign_w, sign_h, aruco_w, aruco_h):
+        # 1. ХАК ДЛЯ СИСТЕМНЫХ ПУТЕЙ PANDA3D (Принудительно подтягиваем встроенные модели)
+        import os
+        import panda3d
+        from panda3d.core import getModelPath
+        
+        panda_dir = os.path.dirname(panda3d.__file__)
+        models_dir = os.path.join(panda_dir, "models")
+        
+        # Загружаем ShowBase. Движок инициализирует конвейер
+        ShowBase.__init__(self)
+        
+        if os.path.exists(models_dir):
+            getModelPath().appendPath(models_dir)
+
+        self.cam_width = cam_w
+        self.cam_height = cam_h
+        
+        # Настройка 4-канального offscreen-буфера в оперативной памяти (RGBA)
+        fb_props = FrameBufferProperties.getDefault()
+        win_props = WindowProperties.size(self.cam_width, self.cam_height)
+
+        self.buffer = self.graphicsEngine.makeOutput(
+            self.pipe, "cpu_offscreen_buffer", 0, fb_props, win_props,
+            GraphicsPipe.BF_refuse_window | GraphicsPipe.BF_fb_props_optional
+        )
+
+        self.tex = Texture()
+        self.buffer.addRenderTexture(self.tex, GraphicsOutput.RTM_copy_ram, GraphicsOutput.RTP_color)
+
+        dr = self.buffer.makeDisplayRegion()
+        dr.setCamera(self.cam)
+
+        # Настройка линзы: FOV 120° и ближняя плоскость 1 см, чтобы пол не резался
+        self.cam.node().getLens().setFov(120.0)
+        self.cam.node().getLens().setAspectRatio(self.cam_width / self.cam_height)
+        self.cam.node().getLens().setNearFar(0.01, 100.0)
+
+        # Контрастное освещение сцены (как в Gazebo Classic)
+        dlight = DirectionalLight('sim_sun')
+        dlight.setColor(Vec4(1.0, 1.0, 1.0, 1))
+        dlnp = self.render.attachNewNode(dlight)
+        dlnp.setHpr(0, -75, 0)
+        self.render.setLight(dlnp)
+
+        from panda3d.core import AmbientLight
+        alight = AmbientLight('sim_ambient')
+        alight.setColor(Vec4(0.4, 0.4, 0.4, 1))
+        alnp = self.render.attachNewNode(alight)
+        self.render.setLight(alnp)
+
+        # --- 1. ГЕНЕРАЦИЯ СВЕТЛО-СЕРОГО ПОЛА С АНТИ-РАЗМЫТИЕМ ПОПЕРЕЧНЫХ ЛИНИЙ ---
+        scale_m_to_px = self.SCALE_M_TO_PX
+        floor_w_meters = float(maze_width) + 2.0
+        floor_h_meters = float(maze_height) + 2.0
+        floor_px_w = int(floor_w_meters * scale_m_to_px)
+        floor_px_h = int(floor_h_meters * scale_m_to_px)
+        floor_img = np.ones((floor_px_h, floor_px_w, 3), dtype=np.uint8) * 220 
+
+        # Отрисовка черной линии трассы толщиной 5 см (смещение +1 метр учтено)
+        if len(line_points) >= 6:
+            line_thickness = max(1, int(0.05 * scale_m_to_px))
+            pts = np.array(line_points).reshape(-1, 2)
+            px_pts = ((pts + 1.0) * scale_m_to_px).astype(np.int32)
+            cv2.polylines(floor_img, [px_pts], isClosed=False, color=(0, 0, 0), thickness=line_thickness)
+
+        pil_img = PILImage.fromarray(cv2.cvtColor(floor_img, cv2.COLOR_BGR2RGB))
+        p3d_tex = Texture()
+        p3d_tex.setup2dTexture(floor_px_w, floor_px_h, Texture.T_unsigned_byte, Texture.F_rgb)
+        p3d_tex.setRamImage(pil_img.tobytes())
+
+        # ЖЕЛЕЗНОЕ ИСПРАВЛЕНИЕ ЧЕТКОСТИ:
+        # Отключаем мипмаппинг (сглаживание), который превращал тонкие поперечные линии в "мыло" на CPU.
+        # FT_nearest заставляет процессор рендерить пиксели текстуры без интерполяции и размытия.
+        p3d_tex.setMinfilter(Texture.FT_nearest)
+        p3d_tex.setMagfilter(Texture.FT_nearest)
+        
+        # Включаем максимальную анизотропную фильтрацию (16x) для удержания детализации под острым углом
+        p3d_tex.setAnisotropicDegree(16)
+
+        cm = CardMaker('floor_card')
+        cm.setFrame(-1.0, floor_w_meters - 1.0, -1.0, floor_h_meters - 1.0)
+        floor_node = self.render.attachNewNode(cm.generate())
+        floor_node.setTexture(p3d_tex)
+        floor_node.setP(-90)
+        floor_node.setZ(0.0) 
+
+        # --- 2. РЕНДЕРИНГ ТОЛСТЫХ ОБЪЕМНЫХ КУБОВ СТЕН 1х1х1 МЕТР ---
+        for wall in walls:
+            w_x1, w_x2, w_y1, w_y2 = wall
+            
+            # Фильтруем только оригинальные блоки лабиринта 1х1м
+            if math.isclose(w_x2 - w_x1, 1.0) and math.isclose(w_y2 - w_y1, 1.0):
+                cx = w_x1 + 0.5
+                cy = w_y1 + 0.5
+
+                # Загружаем сплошной 3D-меш куба из встроенных ресурсов Panda3D
+                wall_cube = self.loader.loadModel("box")
+                wall_cube.reparentTo(self.render)
+                
+                # Смещаем куб на -0.5 по X и Y от центра ячейки cx/cy, чтобы компенсировать его угловой origin
+                wall_cube.setPos(cx - 0.5, cy - 0.5, 0.0) 
+                wall_cube.setColor(0.0, 0.6, 0.6, 1) # Яркий бирюзовый Gazebo Classic
+
+        # Размещение знаков на передних гранях толстых кубов
+        for (mx, my), symbol in sign_zones.items():
+            ros_y = float(maze_height - 1 - my)
+            sign_box = self.loader.loadModel("box")
+            sign_box.reparentTo(self.render)
+            
+            sign_box.setPos(mx + 0.5 - (sign_w / 2.0), ros_y - 0.01, 0.5 - (sign_h / 2.0)) 
+            sign_box.setScale(sign_w, 0.02, sign_h) 
+
+            try:
+                sign_tex = Texture()
+                if symbol == 'S': sign_tex.read("textures/stop_sign.png")
+                elif symbol == 'L': sign_tex.read("textures/turn_left.png")
+                elif symbol == 'R': sign_tex.read("textures/turn_right.png")
+                sign_box.setTexture(sign_tex, 1)
+            except:
+                if symbol == 'S': sign_box.setColor(1, 0, 0, 1)
+                elif symbol == 'L': sign_box.setColor(0, 0, 1, 1)
+                elif symbol == 'R': sign_box.setColor(0, 1, 0, 1)
+
+        # --- 3. НАКЛЕИВАНИЕ ARUCO-МАРКЕРОВ НА ОРТОГОНАЛЬНЫЕ ГРАНИ ТОЛСТЫХ КУБОВ ---
+        try:
+            aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+            for i in range(0, len(aruco_markers), 4):
+                ax, ay, side_idx, aid = aruco_markers[i:i+4]
+                side = int(side_idx) % 4
+                
+                ros_y = float(maze_height - 1 - int(ay))
+                w_x1, w_x2 = float(ax), float(ax) + 1.0
+                w_y1, w_y2 = ros_y, ros_y + 1.0
+
+                m_img = cv2.aruco.generateImageMarker(aruco_dict, id=int(aid), sidePixels=256)
+                m_rgb = cv2.cvtColor(m_img, cv2.COLOR_GRAY2RGB)
+                pil_m = PILImage.fromarray(m_rgb)
+                m_tex = Texture()
+                m_tex.setup2dTexture(256, 256, Texture.T_unsigned_byte, Texture.F_rgb)
+                m_tex.setRamImage(pil_m.tobytes())
+                
+                cm_m = CardMaker('aruco_sticker')
+                cm_m.setFrame(-aruco_w/2.0, aruco_w/2.0, -aruco_h/2.0, aruco_h/2.0)
+                sticker = self.render.attachNewNode(cm_m.generate())
+                sticker.setTexture(m_tex, 1)
+
+                # Выравнивание по граням куба 1х1 метр (смещение 0.005 от визуального мерцания полигонов)
+                if side == 0:    # 0 -> Смотрит вправо (Грань w_x2)
+                    sticker.setPos(w_x2 + 0.005, w_y1 + 0.5, aruco_h / 2.0)
+                    sticker.setHpr(90, 0, 0)
+                elif side == 1:  # 1 -> Смотрит вперед (Грань w_y2)
+                    sticker.setPos(w_x1 + 0.5, w_y2 + 0.005, aruco_h / 2.0)
+                    sticker.setHpr(180, 0, 0)
+                elif side == 2:  # 2 -> Смотрит влево (Грань w_x1)
+                    sticker.setPos(w_x1 - 0.005, w_y1 + 0.5, aruco_h / 2.0)
+                    sticker.setHpr(-90, 0, 0)
+                elif side == 3:  # 3 -> Смотрит назад (Грань w_y1)
+                    sticker.setPos(w_x1 + 0.5, w_y1 - 0.005, aruco_h / 2.0)
+                    sticker.setHpr(0, 0, 0)
+        except Exception as e:
+            print(f"Ошибка 3D-рендеринга ArUco: {e}")
 
 class MockMoebiusMaze(Node):
     def __init__(self):
@@ -116,6 +301,30 @@ class MockMoebiusMaze(Node):
         # Таймер для периодической публикации карты (например, раз в секунду)
         self.map_timer = self.create_timer(1.0, self.publish_map)
 
+        # --- ИНИЦИАЛИЗАЦИЯ 3D-ДВИЖОК ПО ОРИГИНАЛЬНОМУ SELF.WALLS ---
+        self.declare_parameter('line_points', [1.5, 1.5, 2.5, 1.5]) 
+        self.declare_parameter('sign_width', 0.3)
+        self.declare_parameter('sign_height', 0.3)
+        self.declare_parameter('aruco_width', 0.4)
+        self.declare_parameter('aruco_height', 0.4)
+        self.declare_parameter('aruco_markers', [2.0, 2.0, 0.0, 42.0]) # Пока не внедряем в физику
+
+        self.bridge = CvBridge()
+
+        # Читаем параметры из YAML
+        line_pts = self.get_parameter('line_points').get_parameter_value().double_array_value
+        aruco_mk = self.get_parameter('aruco_markers').get_parameter_value().double_array_value
+        sign_w = self.get_parameter('sign_width').get_parameter_value().double_value
+        sign_h = self.get_parameter('sign_height').get_parameter_value().double_value
+        aruco_w = self.get_parameter('aruco_width').get_parameter_value().double_value
+        aruco_h = self.get_parameter('aruco_height').get_parameter_value().double_value
+
+        # Передаем оригинальный self.walls, созданный твоим кодом.
+        self.renderer = PandaRenderer(
+            self.cam_width, self.cam_height, self.walls, 
+            self.sign_zones, self.maze_height, self.maze_width, line_pts, aruco_mk,
+            sign_w, sign_h, aruco_w, aruco_h
+        )
 
         self.get_logger().info("Нода Moebius запущена (Разрешение камеры: 320x240, Векторный NumPy).")
 
@@ -217,127 +426,58 @@ class MockMoebiusMaze(Node):
         scan.ranges = ranges.tolist()
         self.scan_pub.publish(scan)
 
-        # 4. ПОЛНОСТЬЮ ВЕКТОРНАЯ МАК-КАМЕРА С FOV 120° (ИСПРАВЛЕНА РАСПАКОВКА NUMPY)
+        # --- 4. ПОЛНОСТЬЮ АППАРАТНАЯ 3D-КАМЕРА (СТРОГАЯ СОНАПРАВЛЕННОСТЬ ОСЕЙ) ---
         self.frame_count += 1
-        if self.frame_count % 3 == 0:  # Частота кадров ~16 Гц
-            img = Image()
-            img.header.stamp = time_msg; img.header.frame_id = 'camera_link'
-            img.height = self.cam_height; img.width = self.cam_width
-            img.encoding = 'bgr8'; img.step = self.cam_width * 3
-
-            # Базовый кадр (Потолок и Пол в формате BGR)
-            frame = np.zeros((self.cam_height, self.cam_width, 3), dtype=np.uint8)
-            frame[0:120, :, 0] = 100  # B потолка
-            frame[0:120, :, 1] = 50   # G потолка
-            frame[0:120, :, 2] = 50   # R потолка
-            frame[120:240, :, :] = 60 # Серый пол
-
-            # Настраиваем FOV 120 градусов
-            fov_deg = 120.0
-            fov_rad = math.radians(fov_deg)
-
-            cols = np.arange(self.cam_width)
-            # Угол для каждой колонки кадра (от -60° до +60°)
-            rel_angles = -((cols - self.cam_width // 2) / (self.cam_width // 2)) * (fov_rad / 2.0)
+        if self.frame_count % 3 == 0:  # Частота кадров камеры ~16 Гц
             
-            # Переводим в градусные индексы Лидара (-60° ... +60°)
-            rel_angles_deg = np.degrees(rel_angles).astype(int)
-            lidar_indices = (rel_angles_deg) % 360
+            # ЧЕСТНОЕ ДИРЕКТНОЕ СОПОСТАВЛЕНИЕ 1-в-1:
+            # Твой X (вправо по матрице) -> это Panda X (вправо)
+            # Твой Y (вверх по матрице)   -> это Panda Y (вперед/вверх)
+            # Высота камеры — 15 см над полом
+            self.renderer.cam.setPos(float(self.x), float(self.y), 0.15)
             
-            dist_cols = np.array(scan.ranges)[lidar_indices]
+            # Синхронизация угла курса:
+            # Переводим радианы th в градусы и вычитаем 90.0, 
+            # чтобы выровнять базовый нулевой вектор взгляда робота и движка Panda3D
+            angle_deg = math.degrees(self.th) - 90.0
+            self.renderer.cam.setHpr(angle_deg, 0, 0) # Смотрим строго вперед горизонтально
 
-            # Мягкая и естественная высота стен по твоей оригинальной формуле
-            wall_heights = (self.cam_height / (dist_cols + 0.001)).astype(int)
-            wall_heights = np.clip(wall_heights, 0, self.cam_height)
+            # Жесткий синхронный запуск рендеринга кадра в память CPU
+            self.renderer.graphicsEngine.renderFrame()
+            self.renderer.graphicsEngine.syncFrame()
 
-            start_y = self.cam_height // 2 - wall_heights // 2
-            end_y = self.cam_height // 2 + wall_heights // 2
-            brightness = np.clip(180 - dist_cols * 18, 0, 255).astype(np.uint8)
+            # Копируем пиксели из RAM-буфера текстуры
+            tex_data = self.renderer.tex.getRamImage()
+            if tex_data is None:
+                return
 
-            # 1. Заливаем фоновые бирюзовые стены
-            for col in range(self.cam_width):
-                y_top = start_y[col]
-                y_bottom = end_y[col]
-                if wall_heights[col] > 0:
-                    frame[y_top:y_bottom, col, 0] = brightness[col] # B
-                    frame[y_top:y_bottom, col, 1] = brightness[col] # G
-                    frame[y_top:y_bottom, col, 2] = 0               # R
+            # Выкачиваем изолированную копию байт из C++ ядра Panda3D
+            raw_bytes = tex_data.get_data()
+            img_np = np.frombuffer(raw_bytes, dtype=np.uint8).copy()
+            
+            # Проверка размера массива для 4 каналов (RGBA отдает RTM_copy_ram): 240 * 320 * 4
+            expected_size = self.cam_height * self.cam_width * 4
+            if img_np.size == 0 or img_np.size != expected_size:
+                return
 
-            # Переносим индексы стен Лидара на колонки камеры
-            wall_indices_for_cols = closest_wall_indices[lidar_indices]
+            # Формируем стандартную матрицу OpenCV
+            frame_rgba = img_np.reshape((self.cam_height, self.cam_width, 4))
+            
+            # Отсекаем альфа-канал, переводя в чистый 3-канальный BGR (как в твоей старой версии)
+            frame = cv2.cvtColor(frame_rgba, cv2.COLOR_BGRA2BGR)
+            frame = cv2.flip(frame, 0) # Исправляем вертикальный переворот буфера Panda3D
 
-            # Группируем видимые колонки по индексам стен
-            visible_walls = {}
-            for col in range(self.cam_width):
-                w_idx = wall_indices_for_cols[col]
-                if w_idx not in visible_walls:
-                    visible_walls[w_idx] = []
-                visible_walls[w_idx].append(col)
+            # Ручная сборка сообщения Image — в точности как у тебя (100% совместимость с RViz)
+            img_msg = Image()
+            img_msg.header.stamp = time_msg
+            img_msg.header.frame_id = 'camera_link'
+            img_msg.height = self.cam_height
+            img_msg.width = self.cam_width
+            img_msg.encoding = 'bgr8'
+            img_msg.step = self.cam_width * 3  # Жесткий шаг строки: 320 * 3 = 960 байт
+            img_msg.data = frame.tobytes()
 
-            # 2. РЕНДЕРИНГ ТРАПЕЦИЙ С АДЕКВАТНЫМ НАКЛОНОМ КРАЕВ
-            import cv2
-
-            for w_idx, columns in visible_walls.items():
-                wall_coords = self.walls[w_idx]
-                
-                # ЖЕЛЕЗНОЕ ИСПРАВЛЕНИЕ: Достаем скалярные значения по индексам из [x1, x2, y1, y2]
-                w_x1 = float(wall_coords[0])
-                w_y1 = float(wall_coords[2])
-                
-                mx = int(w_x1)
-                my = int(self.maze_height - 1 - int(w_y1))
-
-                if (mx, my) in self.sign_zones:
-                    total_cols = len(columns)
-                    
-                    if total_cols >= 3:
-                        one_third = total_cols // 3
-                        center_cols = columns[one_third : total_cols - one_third]
-                        
-                        if len(center_cols) >= 2:
-                            # Берем левый и правый лучи центральной трети знака
-                            left_col = center_cols[0]
-                            right_col = center_cols[-1]
-
-                            # Берём чистые высоты из сбалансированного массива стен
-                            h_left = wall_heights[left_col]
-                            h_right = wall_heights[right_col]
-                            
-                            y_top_left = start_y[left_col]
-                            y_top_right = start_y[right_col]
-
-                            # Строим вершины трапеции. Наклон линий теперь мягкий и реалистичный.
-                            pt_top_left  = [left_col, y_top_left + h_left // 3]
-                            pt_bot_left  = [left_col, y_top_left + (2 * h_left) // 3]
-                            
-                            pt_top_right = [right_col, y_top_right + h_right // 3]
-                            pt_bot_right = [right_col, y_top_right + (2 * h_right) // 3]
-
-                            # Назначаем цвет знака в BGR с тенями
-                            mid_col = center_cols[len(center_cols) // 2]
-                            br = brightness[mid_col]
-                            
-                            sign_type = self.sign_zones[(mx, my)]
-                            if sign_type == 'S':    # STOP — Красный
-                                color = (0, 0, int(br))
-                            elif sign_type == 'L':  # Налево — Синий
-                                color = (int(br), 0, 0)
-                            elif sign_type == 'R':  # Направо — Зеленый
-                                color = (0, int(br), 0)
-                            else:
-                                color = (0, 0, 0)
-
-                            pts_arr = np.array([
-                                pt_top_left,
-                                pt_top_right,
-                                pt_bot_right,
-                                pt_bot_left
-                            ], dtype=np.int32)
-
-                            cv2.fillPoly(frame, [pts_arr], color)
-
-            img.data = frame.tobytes()
-            self.cam_pub.publish(img)
+            self.cam_pub.publish(img_msg)
 
 
     def is_clear(self, x, y):

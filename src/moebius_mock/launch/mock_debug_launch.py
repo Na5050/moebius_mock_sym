@@ -73,6 +73,6 @@ def generate_launch_description():
         declare_scene_arg, # Обязательно регистрируем аргумент в лаунчере
         mock_robot_node,
         robot_state_publisher_node,
-        rviz_node,
+        #rviz_node,
         autopilot_node
     ])
