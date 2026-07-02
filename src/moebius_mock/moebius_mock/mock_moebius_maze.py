@@ -28,12 +28,12 @@ loadPrcFileData("", "notify-level-device error")
 from direct.showbase.ShowBase import ShowBase
 from cv_bridge import CvBridge
 # --- ГЛОБАЛЬНЫЕ КОНСТАНТЫ СИМУЛЯТОРА ---
-ARUCO_BOX_THICKNESS = 0.05  # Толщина маркерной коробки: ровно 5 см
+BOX_THICKNESS = 0.05  # Толщина маркерной коробки: ровно 5 см
 class PandaRenderer(ShowBase):
     # Разрешение подложки пола: 512 пикселей на 1 метр лабиринта (1 пиксель = 2 мм)
     SCALE_M_TO_PX = 512.0
 
-    def __init__(self, cam_w, cam_h, walls, sign_zones, maze_height, maze_width, line_points, aruco_markers, sign_w, sign_h, aruco_w, aruco_h):
+    def __init__(self, cam_w, cam_h, walls, road_sgn_poses, road_sgn_files, maze_height, maze_width, line_points, aruco_markers, sign_w, sign_h, aruco_w, aruco_h):
         # 1. ХАК ДЛЯ СИСТЕМНЫХ ПУТЕЙ PANDA3D (Принудительно подтягиваем встроенные модели)
         import os
         import panda3d
@@ -148,26 +148,6 @@ class PandaRenderer(ShowBase):
             # Красим все физические преграды Лидара в фирменный бирюзовый цвет Gazebo Classic
             wall_cube.setColor(0.0, 0.6, 0.6, 1)
 
-        # Размещение знаков на передних гранях толстых кубов
-        for (mx, my), symbol in sign_zones.items():
-            ros_y = float(maze_height - 1 - my)
-            sign_box = self.loader.loadModel("box")
-            sign_box.reparentTo(self.render)
-            
-            sign_box.setPos(mx + 0.5 - (sign_w / 2.0), ros_y - 0.01, 0.5 - (sign_h / 2.0)) 
-            sign_box.setScale(sign_w, 0.02, sign_h) 
-
-            try:
-                sign_tex = Texture()
-                if symbol == 'S': sign_tex.read("textures/stop_sign.png")
-                elif symbol == 'L': sign_tex.read("textures/turn_left.png")
-                elif symbol == 'R': sign_tex.read("textures/turn_right.png")
-                sign_box.setTexture(sign_tex, 1)
-            except:
-                if symbol == 'S': sign_box.setColor(1, 0, 0, 1)
-                elif symbol == 'L': sign_box.setColor(0, 0, 1, 1)
-                elif symbol == 'R': sign_box.setColor(0, 1, 0, 1)
-
         # --- 3. НАКЛЕИВАНИЕ ARUCO-МАРКЕРОВ НА ВНЕШНИЕ ГРАНИ ТОНКИХ КУБОВ (ЧЕРЕЗ МОДУЛЬНУЮ ТОЛЩИНУ) ---
         try:
             aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -182,7 +162,7 @@ class PandaRenderer(ShowBase):
                 # Рассчитываем геометрию на основе глобальной константы из модуля
                 box_width = aruco_w + 0.10
                 half_box_w = box_width / 2.0
-                half_th = ARUCO_BOX_THICKNESS / 2.0
+                half_th = BOX_THICKNESS / 2.0
                 
                 # Микроскопический отступ (1 миллиметр), чтобы наклейка не сливалась со стенкой
                 gap = 0.001 
@@ -230,6 +210,95 @@ class PandaRenderer(ShowBase):
         except Exception as e:
             print(f"Ошибка 3D-рендеринга наклеек ArUco: {e}")
 
+        # --- 4. НАКЛЕИВАНИЕ ДОРОЖНЫХ ЗНАКОВ НАПРЯМУЮ ИЗ ФАЙЛОВ КАРТИНОК ИЗ YAML ---
+        try:
+            # Считаем, сколько знаков у нас задано в массиве позиций
+            from ament_index_python.packages import get_package_share_directory
+            pkg_dir = get_package_share_directory('moebius_mock')
+
+            num_signs = len(road_sgn_poses) // 3
+            
+            for idx in range(num_signs):
+                # Извлекаем тройку чисел для текущего знака
+                sx = road_sgn_poses[idx * 3]
+                sy = road_sgn_poses[idx * 3 + 1]
+                side_idx = road_sgn_poses[idx * 3 + 2]
+                
+                # Достаем имя файла картинки из строкового массива по этому же индексу знака!
+                # Если в YAML файлов меньше, чем знаков, защищаем код от падения по IndexError
+                if idx < len(road_sgn_files):
+                    img_filename = road_sgn_files[idx]
+                else:
+                    img_filename = "default_fallback.png"
+
+                # Загружаем битовый файл текстуры знака напрямую по переданному имени файла
+                sign_tex = Texture()
+                texture_path = os.path.join(pkg_dir, 'textures', img_filename)
+                success = sign_tex.read(texture_path)
+                
+                # Если файл картинки не найден в папке textures/, создаем резервную серую заглушку
+                if not success:
+                    print(f"Предупреждение: Файл текстуры textures/{img_filename} не найден!")
+                    sign_tex.setup2dTexture(16, 16, Texture.T_unsigned_byte, Texture.F_rgb)
+                    sign_tex.setClearColor(Vec4(0.3, 0.3, 0.3, 1)) # Серый цвет
+                    sign_tex.clear()
+
+                # Клеим картинку знака строго на внешнюю грань бирюзовой тонкой коробки!
+                # Координаты опорного угла из YAML
+                w_x1 = float(sx)
+                w_y1 = float(sy)
+
+                # Рассчитываем геометрию на основе глобальной константы из модуля
+                box_width = sign_w + 0.10
+                half_box_w = box_width / 2.0
+                half_th = BOX_THICKNESS / 2.0
+
+                # Микроскопический отступ (1 миллиметр), чтобы наклейка не сливалась со стенкой
+                gap = 0.001
+
+                # Генерируем ArUco маркер с исправлением инверсии цветов
+                #m_img = cv2.aruco.generateImageMarker(aruco_dict, id=int(aid), sidePixels=256)
+                #m_img = cv2.bitwise_not(m_img)
+                #m_rgb = cv2.cvtColor(m_img, cv2.COLOR_GRAY2RGB)
+
+                #pil_m = PILImage.fromarray(m_rgb)
+                #m_tex = Texture()
+                #m_tex.setup2dTexture(256, 256, Texture.T_unsigned_byte, Texture.F_rgb)
+                #m_tex.setRamImage(pil_m.tobytes())
+
+                cm_m = CardMaker('sign_sticker')
+                cm_m.setFrame(-sign_w/2.0, sign_w/2.0, -sign_h/2.0, sign_h/2.0)
+                sticker = self.render.attachNewNode(cm_m.generate())
+                sticker.setTexture(sign_tex, 1)
+
+                z_pos = 0.5  # Центр по высоте
+
+                # МАТЕМАТИЧЕСКИ ИДЕАЛЬНОЕ СОВПАДЕНИЕ С ЗАПЕКАНИЕМ:
+                # Наклейка выносится ровно на внешнюю плоскость бирюзовой преграды (half_th + gap)
+                if side_idx == 0:    # 0 -> Смотрит вправо
+                    bx = w_x1 + half_th
+                    by = w_y1 + half_box_w
+                    sticker.setPos(bx + half_th + gap, by, z_pos)
+                    sticker.setHpr(90, 0, 0)
+                elif side_idx == 1:  # 1 -> Смотрит вперед
+                    bx = w_x1 + half_box_w
+                    by = w_y1 + half_th
+                    sticker.setPos(bx, by + half_th + gap, z_pos)
+                    sticker.setHpr(180, 0, 0)
+                elif side_idx == 2:  # 2 -> Смотрит влево
+                    bx = w_x1 - half_th
+                    by = w_y1 + half_box_w
+                    sticker.setPos(bx - half_th - gap, by, z_pos)
+                    sticker.setHpr(-90, 0, 0)
+                elif side_idx == 3:  # 3 -> Смотрит назад
+                    bx = w_x1 + half_box_w
+                    by = w_y1 - half_th
+                    sticker.setPos(bx, by - half_th - gap, z_pos)
+                    sticker.setHpr(0, 0, 0)
+                
+        except Exception as e:
+            print(f"Ошибка 3D-рендеринга файлов дорожных знаков: {e}")
+
 class MockMoebiusMaze(Node):
     def __init__(self):
         super().__init__('mock_moebius_maze')
@@ -276,10 +345,6 @@ class MockMoebiusMaze(Node):
                     # Инвертируем y, чтобы Строка 0 стала самым верхом (maze_height - 1 - y)
                     ros_y = float(self.maze_height - 1 - y)
                     walls.append([float(x), float(x) + 1.0, ros_y, ros_y + 1.0])
-                    
-                    # Если это буква знака, запоминаем её позицию
-                    if symbol != '#':
-                        self.sign_zones[(x, y)] = symbol
 
         # --- ИНИЦИАЛИЗАЦИЯ 3D-ДВИЖОК ПО ОРИГИНАЛЬНОМУ SELF.WALLS ---
         self.declare_parameter('line_points', [1.5, 1.5, 2.5, 1.5])
@@ -288,6 +353,8 @@ class MockMoebiusMaze(Node):
         self.declare_parameter('aruco_width', 0.4)
         self.declare_parameter('aruco_height', 0.4)
         self.declare_parameter('aruco_markers', [2.0, 2.0, 0.0, 42.0]) # Пока не внедряем в физику
+        self.declare_parameter('road_signs_poses', [3.0, 2.0, 3.0]) # Позиции знаков (числа)
+        self.declare_parameter('road_signs_files', ["red.png"]) # Имена файлов (строки)
 
         self.bridge = CvBridge()
 
@@ -298,10 +365,42 @@ class MockMoebiusMaze(Node):
         sign_h = self.get_parameter('sign_height').get_parameter_value().double_value
         aruco_w = self.get_parameter('aruco_width').get_parameter_value().double_value
         aruco_h = self.get_parameter('aruco_height').get_parameter_value().double_value
-        #ARUCO_BOX_THICKNESS = 0.05
+        road_sgn_poses = self.get_parameter('road_signs_poses').get_parameter_value().double_array_value
+        road_sgn_files = self.get_parameter('road_signs_files').get_parameter_value().string_array_value
 
-        # 2. ОСТОРОЖНОЕ ЗАПЕКАНИЕ: дописываем кубы ArUco-маркеров как полноценные жесткие кубы 1х1м
-        # Координаты ay принудительно инвертируем (maze_height - 1 - ay), чтобы они совпали с сеткой ROS 2!
+        # 2. ОСТОРОЖНОЕ ЗАПЕКАНИЕ: дописываем кубы знаков / маркеров как полноценные жесткие кубы
+        for i in range(0, len(road_sgn_poses), 3):
+            ax, ay, side_idx = road_sgn_poses[i:i+3]
+            side = int(side_idx) % 4
+
+            # Координаты левого нижнего угла куба лабиринта, к которому привязан маркер
+            w_x1 = float(ax)
+            w_y1 = float(ay)
+            w_x2 = w_x1
+            w_y2 = w_y1
+
+            # Ширина коробки-подложки: размер маркера + 5 см с каждой стороны (+10 см всего)
+            box_width = sign_w + 0.10
+            half_box_w = box_width / 2.0
+            half_th = BOX_THICKNESS / 2.0
+
+            # Математический расчет ортогональных границ [x1, x2, y1, y2] для Лидара и физики
+            if side == 0:    # 0 -> Смотрит вправо (Прижата к правой грани куба w_x2)
+                cx = w_x2 + half_th
+                cy = w_y1 + half_box_w
+                walls.append([cx - half_th, cx + half_th, cy - half_box_w, cy + half_box_w])
+            elif side == 1:  # 1 -> Смотрит вперед (Прижата к дальней грани куба w_y2)
+                cx = w_x1 + half_box_w
+                cy = w_y2 + half_th
+                walls.append([cx - half_box_w, cx + half_box_w, cy - half_th, cy + half_th])
+            elif side == 2:  # 2 -> Смотрит влево (Прижата к левой грани куба w_x1)
+                cx = w_x1 - half_th
+                cy = w_y1 + half_box_w
+                walls.append([cx - half_th, cx + half_th, cy - half_box_w, cy + half_box_w])
+            elif side == 3:  # 3 -> Смотрит назад (Прижата к ближней грани куба w_y1)
+                cx = w_x1 + half_box_w
+                cy = w_y1 - half_th
+                walls.append([cx - half_box_w, cx + half_box_w, cy - half_th, cy + half_th])
         for i in range(0, len(aruco_mk), 4):
             ax, ay, side_idx, aid = aruco_mk[i:i+4]
             side = int(side_idx) % 4
@@ -315,7 +414,7 @@ class MockMoebiusMaze(Node):
             # Ширина коробки-подложки: размер маркера + 5 см с каждой стороны (+10 см всего)
             box_width = aruco_w + 0.10
             half_box_w = box_width / 2.0
-            half_th = ARUCO_BOX_THICKNESS / 2.0
+            half_th = BOX_THICKNESS / 2.0
 
             # Математический расчет ортогональных границ [x1, x2, y1, y2] для Лидара и физики
             if side == 0:    # 0 -> Смотрит вправо (Прижата к правой грани куба w_x2)
@@ -389,7 +488,15 @@ class MockMoebiusMaze(Node):
                     if x == ax and y == ay:
                         is_aruco_cell = True
                         break
-                
+
+                # Проверяем, привязан ли к этой ячейке (x, y) знак из YAML
+                for i in range(0, len(road_sgn_poses), 3):
+                    ax = int(road_sgn_poses[i]) #+half_th if road_sgn_poses[i+2]%2==0 else ((sign_w + 0.10) / 2.0))
+                    ay = int(self.maze_height-(road_sgn_poses[i+1])) #+half_th if road_sgn_poses[i+2]%2==1 else ((sign_w + 0.10) / 2.0)))
+                    if x == ax and y == ay:
+                        is_aruco_cell = True
+                        break
+
                 # Присваиваем веса ячейкам для RViz2 /map
                 if self.maze[y][x] in ['#', 'S', 'L', 'R']:
                     map_data.append(100) # Глухая стена лабиринта -> ЧЕРНЫЙ цвет
@@ -406,7 +513,7 @@ class MockMoebiusMaze(Node):
         # Передаем оригинальный self.walls, созданный твоим кодом.
         self.renderer = PandaRenderer(
             self.cam_width, self.cam_height, self.walls, 
-            self.sign_zones, self.maze_height, self.maze_width, line_pts, aruco_mk,
+            road_sgn_poses, road_sgn_files, self.maze_height, self.maze_width, line_pts, aruco_mk,
             sign_w, sign_h, aruco_w, aruco_h
         )
 
