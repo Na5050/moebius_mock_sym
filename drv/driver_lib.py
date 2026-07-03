@@ -146,6 +146,177 @@ class HttpStreamerNode(Node):
 # HSV на :8082
 #self.add_node(HttpStreamerNode(self.bb, key='hsv_jpeg', port=8082))
 
+class TreeDashboardNode(Node):
+    """HTTP дашборд с деревом поведения. Без видеопотока."""
+
+    _counter = 0
+
+    def __init__(self, driver, port=8079):
+        TreeDashboardNode._counter += 1
+        node_name = f'tree_dashboard_{TreeDashboardNode._counter}'
+        super().__init__(node_name)
+        self._driver = driver
+        self._httpd = None
+        self._running = True
+        self._start_server(port)
+        self.get_logger().info(f"Дашборд дерева на http://localhost:{port}")
+
+    def _start_server(self, port):
+        driver = self._driver
+        node = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == '/tree':
+                    self.send_response(200)
+                    self.send_header('Content-type', 'application/json')
+                    self.end_headers()
+                    tree_data = self._get_tree()
+                    import json
+                    self.wfile.write(json.dumps(tree_data).encode())
+
+                elif self.path == '/' or self.path == '/dashboard':
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(self._html().encode())
+
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def _get_tree(self):
+                if driver is None or driver._bt_root is None:
+                    return {"name": "Нет данных", "children": [], "state": ""}
+                return self._node_to_dict(driver._bt_root)
+
+            def _node_to_dict(self, bt_node):
+                name = getattr(bt_node, 'name', type(bt_node).__name__)
+                state = getattr(bt_node, '_state', '')
+                
+                children = []
+                if hasattr(bt_node, 'child'):
+                    children.append(self._node_to_dict(bt_node.child))
+                elif hasattr(bt_node, 'children'):
+                    for child in bt_node.children:
+                        children.append(self._node_to_dict(child))
+                
+                return {"name": name, "state": state or "IDLE", "children": children}
+
+            def _html(self):
+                return """<!DOCTYPE html>
+<html><head><title>Tree Dashboard</title>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Courier New', monospace; background: #0a0a1a; color: #0f0; padding: 20px; }
+  h1 { font-size: 18px; margin-bottom: 15px; }
+  .tree { font-size: 13px; line-height: 1.0; }
+  .node { padding: 1px 0; }
+  .RUNNING { color: #ff0; }
+  .SUCCESS { color: #0f0; }
+  .FAILURE { color: #f00; }
+  .IDLE { color: #666; }
+  .NO-STATE { color: #444; }
+  #legend { margin-top: 20px; font-size: 11px; color: #888; }
+  #legend span { margin-right: 15px; }
+  #time { font-size: 12px; color: #888; margin-left: 10px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .dot.RUNNING { background: #ff0; box-shadow: 0 0 6px #ff0; }
+  .dot.SUCCESS { background: #0f0; }
+  .dot.FAILURE { background: #f00; }
+  .dot.IDLE, .dot.NO-STATE { background: #444; }
+</style></head><body>
+<h1>🌳 Древо жизни <span id="time"></span></h1>
+<div class="tree" id="tree"></div>
+<div id="legend">
+  <span><span class="dot RUNNING"></span> RUNNING</span>
+  <span><span class="dot SUCCESS"></span> SUCCESS</span>
+  <span><span class="dot FAILURE"></span> FAILURE</span>
+  <span><span class="dot NO-STATE"></span> IDLE</span>
+</div>
+<script>
+  var flatNodes = [];
+const STATE_MAP = {
+    'START': 'IDLE',
+    'WAITING_RESPONSE': 'RUNNING',
+    'MOVING': 'RUNNING',
+    'IDLE': 'IDLE',
+    'RUNNING': 'RUNNING',
+    'SUCCESS': 'SUCCESS',
+    'FAILURE': 'FAILURE',
+    'ABORTED_STUCK': 'FAILURE',
+    'ABORTED_TIMEOUT': 'FAILURE',
+};
+  function flatten(node, depth) {
+    depth = depth || 0;
+    var result = [];
+    result.push({name: node.name, state: node.state || 'NO-STATE', depth: depth});
+    if (node.children) {
+      node.children.forEach(function(child) {
+        result = result.concat(flatten(child, depth + 1));
+      });
+    }
+    return result;
+  }
+
+  function updateTree() {
+    fetch('/tree')
+      .then(r => r.json())
+      .then(data => {
+        var container = document.getElementById('tree');
+        var newFlat = flatten(data);
+        
+        var changed = flatNodes.length !== newFlat.length;
+        if (!changed) {
+          for (var i = 0; i < newFlat.length; i++) {
+            if (newFlat[i].state !== flatNodes[i].state) {
+              changed = true;
+              break;
+            }
+          }
+        }
+        
+        if (changed) {
+          container.innerHTML = '';
+          newFlat.forEach(function(n) {
+            var div = document.createElement('div');
+            var displayState = STATE_MAP[n.state] || n.state || 'IDLE';
+            div.className = 'node ' + displayState;
+            var indent = '│  '.repeat(n.depth);
+            var prefix = n.depth > 0 ? '├─ ' : '';
+            var dot = '<span class="dot ' + n.state + '"></span>';
+            div.innerHTML = indent + prefix + dot + n.name;
+            container.appendChild(div);
+          });
+          flatNodes = newFlat;
+        }
+        
+        document.getElementById('time').textContent = new Date().toLocaleTimeString();
+      })
+      .catch(e => {});
+  }
+
+  setInterval(updateTree, 500);
+  updateTree();
+</script>
+</body></html>"""
+
+        socketserver.TCPServer.allow_reuse_address = True
+        self._httpd = socketserver.TCPServer(('0.0.0.0', port), Handler)
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+
+    def destroy_node(self):
+        self._running = False
+        if self._httpd:
+            self._httpd.socket.close()
+            self._httpd.server_close()
+            self.get_logger().info("Дашборд дерева остановлен")
+        super().destroy_node()
+
 # ==============================================================================
 # 1. БАЗОВЫЙ КЛАСС-КЛИЕНТ АВТОПИЛОТА (DRIVER)
 # ==============================================================================
@@ -212,7 +383,7 @@ class RobotDriver(Node):
             self._bt_root = Parallel([
                 HeartbeatAction(),
                 self._mission_root,
-            ], required_successes=1)
+            ], required_successes=1, name="Цель")
             self._ticker = self.create_timer(1.0 / tick_rate, self._loop)
             self.get_logger().info(f"Миссия готова, тик {tick_rate} Гц")
         else:
@@ -613,20 +784,25 @@ class BTNode:
 class Sequence(BTNode):
     """Последовательное «И»: все дети должны завершиться SUCCESS."""
 
-    def __init__(self, children: list):
+    def __init__(self, children: list, name: str = "Sequence"):
         self.children = children
         self._idx = 0
+        self._state = "IDLE"
+        self.name = name
 
     def reset(self):
         self._idx = 0
+        self._state = "IDLE"
         for child in self.children:
             child.reset()
 
     def tick(self, driver: RobotDriver) -> str:
         if self._idx >= len(self.children):
+            self._state = "SUCCESS"
             return "SUCCESS"
 
         status = self.children[self._idx].tick(driver)
+        self._state = status
 
         if status == "RUNNING":
             return "RUNNING"
@@ -643,20 +819,25 @@ class Sequence(BTNode):
 class Fallback(BTNode):
     """Селектор «ИЛИ»: первый SUCCESS останавливает узел."""
 
-    def __init__(self, children: list):
+    def __init__(self, children: list, name: str = "Fallback"):
         self.children = children
         self._idx = 0
+        self._state = "IDLE"
+        self.name = name
 
     def reset(self):
         self._idx = 0
+        self._state = "IDLE"
         for child in self.children:
             child.reset()
 
     def tick(self, driver: RobotDriver) -> str:
         if self._idx >= len(self.children):
+            self._state = "FAILURE"
             return "FAILURE"
 
         status = self.children[self._idx].tick(driver)
+        self._state = status
 
         if status == "RUNNING":
             return "RUNNING"
@@ -664,19 +845,23 @@ class Fallback(BTNode):
             return "SUCCESS"
         elif status == "FAILURE":
             self._idx += 1
+            self._state = "RUNNING"
             return "RUNNING"
 
 
 class Parallel(BTNode):
     """Параллельный узел: все дети тикаются одновременно."""
 
-    def __init__(self, children: list, required_successes: int = None):
+    def __init__(self, children: list, required_successes: int = None, name: str = "Parallel"):
         self.children = children
         self.required = required_successes if required_successes is not None else len(children)
         self._child_statuses = ["RUNNING"] * len(children)
+        self._state = "IDLE"
+        self.name = name
 
     def reset(self):
         self._child_statuses = ["RUNNING"] * len(self.children)
+        self._state = "IDLE"
         for child in self.children:
             child.reset()
 
@@ -692,20 +877,30 @@ class Parallel(BTNode):
                 failures += 1
 
         if successes >= self.required:
+            self._state = "SUCCESS"
             return "SUCCESS"
         if failures > 0:
+            self._state = "FAILURE"
             return "FAILURE"
+        self._state = "RUNNING"
         return "RUNNING"
 
 
 class Condition(BTNode):
     """Проверка условия — мгновенный SUCCESS или FAILURE."""
 
-    def __init__(self, check_func):
+    def __init__(self, check_func, name: str = "Condition"):
         self._check = check_func
+        self.name = name
+        self._state = "IDLE"
 
     def tick(self, driver: RobotDriver) -> str:
-        return "SUCCESS" if self._check(driver) else "FAILURE"
+        result = self._check(driver)
+        self._state = "SUCCESS" if result else "FAILURE"
+        return "SUCCESS" if result else "FAILURE"
+
+    def reset(self):
+        self._state = "IDLE"
 
 
 # ==============================================================================
@@ -999,11 +1194,22 @@ class StopAction(BTNode):
 
 
 class HeartbeatAction(BTNode):
-    """Бесконечная отправка heartbeat. Всегда возвращает RUNNING."""
+    """Бесконечная отправка heartbeat. RUNNING пока всё живо."""
+
+    def __init__(self):
+        self._state = "RUNNING"
+        self.name = "Пульс"
 
     def tick(self, driver: RobotDriver) -> str:
+        if not rclpy.ok():
+            self._state = "FAILURE"
+            return "FAILURE"
         driver.send_heartbeat()
+        self._state = "RUNNING"
         return "RUNNING"
+
+    def reset(self):
+        self._state = "RUNNING"
 
 
 class EvalAction(BTNode):
@@ -1012,47 +1218,57 @@ class EvalAction(BTNode):
         self._func = func
         self.name = name
         self._done = False
+        self._state = "IDLE"
 
     def tick(self, driver) -> str:
         if not self._done:
             result = self._func(driver)
             driver.get_logger().info(f"[BT] {self.name}: {result}")
             self._done = True
+            self._state = "SUCCESS"
         return "SUCCESS"
 
     def reset(self):
         self._done = False
+        self._state = "IDLE"
 
 class LogAction(BTNode):
     """Печать сообщения в лог. Мгновенный SUCCESS."""
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, name: str = "Log"):
         self._msg = message
         self._done = False
+        self.name = name
+        self._state = "IDLE"
 
     def tick(self, driver: RobotDriver) -> str:
         if not self._done:
             driver.get_logger().info(f"[BT] {self._msg}")
             self._done = True
+            self._state = "SUCCESS"
         return "SUCCESS"
 
     def reset(self):
         self._done = False
+        self._state = "IDLE"
 
 
 class RetryAction(BTNode):
     """Повторить дочерний узел до N раз при FAILURE."""
 
-    def __init__(self, child: BTNode, max_attempts: int = 3):
+    def __init__(self, child: BTNode, max_attempts: int = 3, name: str = "Retry"):
         self.child = child
         self.max_attempts = max_attempts
         self._attempt = 0
+        self.name = name
+        self._state = "IDLE"
 
     def tick(self, driver: RobotDriver) -> str:
         status = self.child.tick(driver)
 
         if status == "SUCCESS":
             self._attempt = 0
+            self._state = "SUCCESS"
             return "SUCCESS"
         elif status == "FAILURE":
             self._attempt += 1
@@ -1062,9 +1278,17 @@ class RetryAction(BTNode):
             self.child.reset()
             if self._attempt >= self.max_attempts:
                 self._attempt = 0
+                self._state = "FAILURE"
                 return "FAILURE"
+            self._state = "RUNNING"
             return "RUNNING"
+        self._state = "RUNNING"
         return "RUNNING"
+
+    def reset(self):
+        self._attempt = 0
+        self._state = "IDLE"
+        self.child.reset()
 
 class StreamAction(BTNode):
     """
@@ -1099,6 +1323,7 @@ class StreamAction(BTNode):
         self._check_start_y = 0.0
         self._check_start_yaw = 0.0
         self._check_interval = 1.0  # Проверяем раз в секунду
+        self._state = "IDLE"
 
     def _log(self, driver, msg: str):
         driver.get_logger().info(f"[BT] {self.name}: {msg}")
@@ -1110,6 +1335,7 @@ class StreamAction(BTNode):
         if self._started and self._stop_condition and self._stop_condition(driver):
             self._log(driver, "Условие завершения выполнено")
             driver.stop()
+            self._state = "SUCCESS"
             return "SUCCESS"
 
         current_x, current_y, current_yaw = driver.get_pose()
@@ -1149,12 +1375,14 @@ class StreamAction(BTNode):
         vx, vy, omega, duration = self._command_func(driver)
         driver.move_time(vx, vy, omega, duration)
         self._started = True
+        self._state = "RUNNING"
         return "RUNNING"
 
     def reset(self):
         self._started = False
         self._last_warn_time = 0.0
         self._last_check_time = 0.0
+        self._state = "IDLE"
 
 # ==============================================================================
 # 3.1 ВСПОМОГАТЕЛЬНЫЕ УЗЛЫ (WaitCondition, RepeatUntil, TimerAction)
@@ -1172,6 +1400,7 @@ class WaitCondition(BTNode):
         self._timeout = timeout
         self.name = name
         self._start_time = None
+        self._state = "IDLE"
 
     def _log(self, driver, msg: str):
         driver.get_logger().info(f"[BT] {self.name}: {msg}")
@@ -1182,21 +1411,27 @@ class WaitCondition(BTNode):
     def tick(self, driver: RobotDriver) -> str:
         if self._start_time is None:
             self._start_time = driver.get_clock().now().nanoseconds * 1e-9
+            self._state = "RUNNING"
 
         if driver.get_clock().now().nanoseconds * 1e-9 - self._start_time > self._timeout:
             self._warn(driver, f"Таймаут {self._timeout}с истёк")
             self._start_time = None
+            self._state = "FAILURE"
             return "FAILURE"
 
         if self._check(driver):
             self._log(driver, "Условие выполнено")
             self._start_time = None
+            self._state = "SUCCESS"
             return "SUCCESS"
+
+        self._state = "RUNNING"
 
         return "RUNNING"
 
     def reset(self):
         self._start_time = None
+        self._state = "IDLE"
 
 
 class RepeatUntil(BTNode):
@@ -1210,23 +1445,28 @@ class RepeatUntil(BTNode):
         self.child = child
         self._stop = stop_condition     # (driver) -> bool
         self.name = name
+        self._state = "IDLE"
 
     def _log(self, driver, msg: str):
         driver.get_logger().info(f"[BT] {self.name}: {msg}")
 
     def tick(self, driver: RobotDriver) -> str:
         if self._stop(driver):
+            self._state = "SUCCESS"
             self._log(driver, "Условие остановки выполнено")
             return "SUCCESS"
 
         status = self.child.tick(driver)
+        self._state = status
         if status == "FAILURE":
             return "FAILURE"
         if status == "SUCCESS":
             self.child.reset()  # <-- ВОТ ЭТО НУЖНО ДОБАВИТЬ
+            self._state = "RUNNING"
         return "RUNNING"
 
     def reset(self):
+        self._state = "IDLE"
         self.child.reset()
 
 
@@ -1241,6 +1481,7 @@ class TimerAction(BTNode):
         self.duration = duration
         self.name = name
         self._start_time = None
+        self._state = "IDLE"
 
     def _log(self, driver, msg: str):
         driver.get_logger().info(f"[BT] {self.name}: {msg}")
@@ -1248,18 +1489,23 @@ class TimerAction(BTNode):
     def tick(self, driver: RobotDriver) -> str:
         if self._start_time is None:
             self._start_time = driver.get_clock().now().nanoseconds * 1e-9
+            self._state = "RUNNING"
 
         if driver.get_clock().now().nanoseconds * 1e-9 - self._start_time > self.duration:
             self._log(driver, f"Время {self.duration}с истекло")
+            self._state = "SUCCESS"
             return "SUCCESS"
 
         status = self.child.tick(driver)
         if status == "FAILURE":
+            self._state = "FAILURE"
             return "FAILURE"
+        self._state = "RUNNING"
         return "RUNNING"
 
     def reset(self):
         self._start_time = None
+        self._state = "IDLE"
         self.child.reset()
 
 
@@ -1309,14 +1555,12 @@ class Blackboard:
 # ==============================================================================
 
 class SubTree(BTNode):
-    """
-    Ссылка на именованный фрагмент дерева.
-    Поддерживает ленивую подстановку: корень может быть установлен после создания.
-    """
+    """Ссылка на именованный фрагмент дерева."""
 
     def __init__(self, name: str = "SubTree"):
         self.name = name
         self._root: BTNode = None
+        self._state = "IDLE"
 
     def set_root(self, root: BTNode):
         self._root = root
@@ -1324,10 +1568,14 @@ class SubTree(BTNode):
     def tick(self, driver: RobotDriver) -> str:
         if self._root is None:
             driver.get_logger().error(f"[BT] {self.name}: корень не установлен")
+            self._state = "FAILURE"
             return "FAILURE"
-        return self._root.tick(driver)
+        status = self._root.tick(driver)
+        self._state = status
+        return status
 
     def reset(self):
+        self._state = "IDLE"
         if self._root is not None:
             self._root.reset()
 
@@ -1342,12 +1590,14 @@ class MissionDispatcher(RobotDriver):
     Может использоваться как самостоятельно, так и внутри AIDecisionAction.
     """
 
-    def __init__(self, node_name: str = 'mission_dispatcher'):
+    def __init__(self, node_name: str = 'mission_dispatcher', name: str = "Mission dispatcher"):
         super().__init__(node_name)
 
         self._missions: dict = {}
         self._current_mission_name: str = "IDLE"
         self._current_mission_root: BTNode = None
+        self._state = "IDLE"
+        self.name = name
 
         self._ticker = self.create_timer(0.2, self._mission_loop)
         self.get_logger().info("Диспетчер миссий готов")
@@ -1368,12 +1618,14 @@ class MissionDispatcher(RobotDriver):
         self.get_logger().info(f"Запуск миссии: {self._current_mission_name} → {name}")
         self._current_mission_name = name
         self._current_mission_root = self._missions[name]
+        self._state = "RUNNING"
 
     def abort_mission(self):
         self.get_logger().info(f"Прерывание миссии: {self._current_mission_name}")
         self.stop()
         self._current_mission_name = "IDLE"
         self._current_mission_root = None
+        self._state = "IDLE"
 
     def get_current_mission(self) -> str:
         return self._current_mission_name
@@ -1381,10 +1633,13 @@ class MissionDispatcher(RobotDriver):
     def _mission_loop(self):
         #self.send_heartbeat()
 
+        self._state = "RUNNING"
         if self._current_mission_root is None:
+            self._state = "IDLE"
             return
 
         status = self._current_mission_root.tick(self)
+        self._state = status
 
         if status == "SUCCESS":
             self.get_logger().info(f"Миссия {self._current_mission_name} завершена успешно")
@@ -1396,24 +1651,16 @@ class MissionDispatcher(RobotDriver):
             self._current_mission_name = "IDLE"
             self._current_mission_root = None
 
-
 class AIDecisionAction(BTNode):
-    """
-    Узел принятия решений.
-    На каждом тике вызывает decision_func(driver) -> имя миссии.
-    Если миссия изменилась — прерывает старую, запускает новую.
-    Тикает текущую миссию.
-    Возвращает RUNNING всегда.
-    """
+    """Узел принятия решений."""
 
-    def __init__(self, decision_func):
-        """
-        decision_func(driver) -> str  (имя миссии)
-        """
+    def __init__(self, decision_func, name: str = "AI"):
         self._decision_func = decision_func
+        self.name = name
         self._current_mission_name = None
         self._current_mission_root = None
         self._missions = {}
+        self._state = "IDLE"
 
     def register_mission(self, name: str, root_node: BTNode):
         self._missions[name] = root_node
@@ -1437,13 +1684,18 @@ class AIDecisionAction(BTNode):
                 driver.get_logger().error(f"[AI] Миссия {self._current_mission_name} провалена")
                 self._current_mission_name = None
                 self._current_mission_root = None
+                self._state = "FAILURE"
+                return "FAILURE"
+            self._state = "RUNNING"
+            return "RUNNING"
 
+        self._state = "RUNNING"
         return "RUNNING"
 
     def reset(self):
         self._current_mission_name = None
         self._current_mission_root = None
-
+        self._state = "IDLE"
 
 # ==============================================================================
 # 5. ПРИМЕР СЦЕНАРИЯ — КВАДРАТ НА ДЕРЕВЕ ПОВЕДЕНИЯ
