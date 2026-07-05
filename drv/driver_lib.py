@@ -70,6 +70,118 @@ class ImageProcessorNode(Node):
         """Переопредели в наследнике. frame — numpy array BGR."""
         raise NotImplementedError("Переопредели process_frame(frame)")
 
+import cv2
+import numpy as np
+from hailo_platform import (VDevice, HEF, ConfigureParams, HailoStreamInterface, 
+                            InputVStreamParams, OutputVStreamParams, InferVStreams)
+
+class HailoProcessorNode(ImageProcessorNode):
+    """
+    Новый базовый класс для любых ИИ-нод на чипе Hailo-8.
+    Наследуется от стандартного ImageProcessorNode вашего робота.
+    """
+    def __init__(self, driver, hef_path, fps=30, node_name=None):
+        # Инициализируем старый базовый класс (он создаст таймер и привяжет driver)
+        super().__init__(driver, fps=fps, node_name=node_name)
+
+        # 1. Аппаратная инициализация Hailo-8
+        self._device = VDevice()
+        self._hef = HEF(hef_path)
+
+        self._configure_params = ConfigureParams.create_from_hef(
+            self._hef, HailoStreamInterface.PCIe
+        )
+        self._network_groups = self._device.configure(self._hef, self._configure_params)
+        self._network_group = self._network_groups[0]
+
+        self._input_vstreams_params = InputVStreamParams.make_from_network_group(self._network_group)
+        self._output_vstreams_params = OutputVStreamParams.make_from_network_group(self._network_group)
+
+        # 2. Определение геометрии входного слоя модели
+        self._input_info = self._hef.get_input_vstream_infos()[0]
+        self._input_name = self._input_info.name
+        self._input_size = self._input_info.shape
+
+        if len(self._input_size) == 4:
+            self._h_in = int(self._input_size[1])
+            self._w_in = int(self._input_size[2])
+        else:
+            self._h_in = int(self._input_size[0])
+            self._w_in = int(self._input_size[1])
+
+        # 3. Фиксация вложенных контекстов активации в памяти
+        self._activated_context = self._network_group.activate()
+        self._activated_app = self._activated_context.__enter__()
+
+        self._pipeline_context = InferVStreams(
+            self._network_group,
+            self._input_vstreams_params,
+            self._output_vstreams_params
+        )
+        self._infer_pipeline = self._pipeline_context.__enter__()
+
+        self.get_logger().info(f"Hailo-8 базовый класс готов. Слой: {self._input_name} ({self._w_in}x{self._h_in})")
+
+    def process_frame(self, frame):
+        display = frame.copy()
+
+        # 1. Полноценный пропорциональный Letterbox под 640x640 с серым фоном 114
+        img_h, img_w = frame.shape[:2]
+        scale = min(self._w_in / img_w, self._h_in / img_h)
+        new_w = int(img_w * scale)
+        new_h = int(img_h * scale)
+        
+        resized = cv2.resize(frame, (new_w, new_h))
+        
+        # Важно: цвет холста 114 (серый стандарт для YOLO)
+        letterbox_img = np.full((self._h_in, self._w_in, 3), 114, dtype=np.uint8)
+        
+        pad_x = (self._w_in - new_w) // 2
+        pad_y = (self._h_in - new_h) // 2
+        letterbox_img[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+        
+        # 2. Переводим в RGB (Официальный стандарт для Hailo Model Zoo)
+        rgb = cv2.cvtColor(letterbox_img, cv2.COLOR_BGR2RGB)
+        
+        # 3. Добавляем батч-размерность (Формат NHWC: 1x640x640x3)
+        batch_data = np.expand_dims(rgb, axis=0)
+        
+        # 4. Делаем массив непрерывным для Си-драйвера PCIe шины
+        input_data = np.ascontiguousarray(batch_data)
+
+        self._pad_info = (pad_x, pad_y, scale)
+
+        t0 = self.get_clock().now()
+        try:
+            input_dict = {self._input_name: input_data}
+            output = self._infer_pipeline.infer(input_dict)
+            dt_ms = (self.get_clock().now() - t0).nanoseconds / 1e6  # миллисекунды
+
+            self.handle_hailo_result(output, display, dt_ms)
+
+        except Exception as e:
+            self.get_logger().error(f"Ошибка инференса Hailo: {e}")
+
+    def handle_hailo_result(self, output, display, dt_ms):
+        """Этот метод ОБЯЗАТЕЛЬНО переопределяется в конечном скрипте миссии"""
+        raise NotImplementedError("Переопредели handle_hailo_result(output, display, dt_ms) в наследнике")
+
+    def __del__(self):
+        if hasattr(self, '_pipeline_context') and self._pipeline_context:
+            try:
+                self._pipeline_context.__exit__(None, None, None)
+            except Exception:
+                pass
+        if hasattr(self, '_activated_context') and self._activated_context:
+            try:
+                self._activated_context.__exit__(None, None, None)
+            except Exception:
+                pass
+        if hasattr(self, '_device') and self._device:
+            del self._device
+        print("Ресурсы HailoProcessorNode успешно очищены.")
+
+
 class HttpStreamerNode(Node):
     """HTTP видеопоток. Стримит JPEG из bb[key]."""
     _counter = 0
