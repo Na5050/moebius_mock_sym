@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#Copyright (c) 2026 Jurij Polikarpov
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -273,6 +274,7 @@ class RobotAutopilot(Node):
         """Фоновый исполнитель автопилота. Работает непрерывно в потоке Executor'а."""
         now = self.get_clock().now()
         ideal_vx, ideal_vy, ideal_omega = 0.0, 0.0, 0.0
+        print(f"\033[91m[auto loop 1\033[0m", flush=True)
 
         with self.lock:
             # --- ЗАЩИТА 1: СТОРОЖЕВОЙ ТАЙМЕР ИИ (WATCHDOG) ---
@@ -370,4 +372,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

@@ -3,6 +3,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.conditions import IfCondition, UnlessCondition # Импортируем оба движка условий
 from launch_ros.actions import Node
 
 def generate_launch_description():
@@ -15,6 +16,30 @@ def generate_launch_description():
         'scene',
         default_value='maze_scene.yaml',
         description='Имя YAML-файла сценария лабиринта из папки config'
+    )
+    # *. Объявляем ОДИН аргумент переключения
+    # По умолчанию он 'false', то есть активирует дефолтную ноду
+    declare_switch_arg = DeclareLaunchArgument(
+        'use_lite',
+        default_value='false',
+        choices=['true', 'false'],
+        description='Переключить запуск на облегченный симулятор (true/false)'
+    )
+
+    # ВВОДИМ НОВЫЙ ФЛАГ: По умолчанию 'false' (rviz выключен)
+    declare_rviz_arg = DeclareLaunchArgument(
+        'start_rviz',
+        default_value='false',
+        choices=['true', 'false'],  # Разрешаем вводить только true или false
+        description='Запустить ноду rviz вместе с симуляцией (true/false)'
+    )
+
+    # ВВОДИМ НОВЫЙ ФЛАГ: По умолчанию 'false' (автопилот выключен)
+    declare_autopilot_arg = DeclareLaunchArgument(
+        'start_autopilot',
+        default_value='false',
+        choices=['true', 'false'],  # Разрешаем вводить только true или false
+        description='Запустить ноду автопилота вместе с симуляцией (true/false)'
     )
 
     # 2. Динамически собираем путь к файлу конфигурации на основе введенного имени
@@ -36,7 +61,18 @@ def generate_launch_description():
         executable='mock_moebius_maze.py',
         name='mock_moebius_maze',
         output='screen',
-        parameters=[config_file_path] # Путь подставится автоматически во время старта
+        parameters=[config_file_path],
+        condition=UnlessCondition(LaunchConfiguration('use_lite')) # Запуск, если НЕ true
+    )
+
+    # Нода симулятора-заглушки (ПРИНИМАЕТ ДИНАМИЧЕСКИЙ ПУТЬ)
+    mock_robot_lite_node = Node(
+        package=mock_package,
+        executable='mock_moebius_maze_opencv.py',
+        name='mock_moebius_maze',
+        output='screen',
+        parameters=[config_file_path],
+        condition=IfCondition(LaunchConfiguration('use_lite')) # Запуск, если true
     )
 
     # Публикатор TF трансформаций
@@ -57,7 +93,8 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         output='screen',
-        parameters=[{'use_sim_time': True}]
+        parameters=[{'use_sim_time': True}],
+        condition=IfCondition(LaunchConfiguration('start_rviz'))
     )
 
     # Ваша нода автопилота
@@ -66,13 +103,19 @@ def generate_launch_description():
         executable='autopilot_node.py',        
         name='robot_autopilot',                
         output='screen',
-        parameters=[{'use_sim_time': True}]   
+        parameters=[{'use_sim_time': True}],
+        # МАНЕВР: Нода запустится, только если LaunchConfiguration равен 'true'
+        condition=IfCondition(LaunchConfiguration('start_autopilot'))
     )
 
     return LaunchDescription([
+        declare_switch_arg,
         declare_scene_arg, # Обязательно регистрируем аргумент в лаунчере
+        declare_autopilot_arg,  # Регистрируем аргумент автопилота
+        declare_rviz_arg,       # Регистрируем аргумент RViz2
         mock_robot_node,
+        mock_robot_lite_node,
         robot_state_publisher_node,
-        #rviz_node,
+        rviz_node,
         autopilot_node
     ])

@@ -33,6 +33,47 @@ import http.server
 import socketserver
 from itertools import count
 
+# ==============================================================================
+# 3.2 BLACKBOARD — общая память между узлами
+# ==============================================================================
+
+class Blackboard:
+    """Потокобезопасная общая память."""
+
+    def __init__(self):
+        self._data = {}
+        self._lock = threading.Lock()
+
+    def set(self, key: str, value):
+        with self._lock:
+            self._data[key] = value
+
+    def get(self, key: str, default=None):
+        with self._lock:
+            return self._data.get(key, default)
+
+    def has(self, key: str) -> bool:
+        with self._lock:
+            return key in self._data
+
+    def delete(self, key: str):
+        with self._lock:
+            if key in self._data:
+                del self._data[key]
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+    def all(self) -> dict:
+        with self._lock:
+            return dict(self._data)
+
+    def update(self, **kwargs):
+        """Потокобезопасное обновление нескольких ключей."""
+        with self._lock:
+            self._data.update(kwargs)
+
 class ImageProcessorNode(Node):
     """Базовый узел обработки изображений. Наследуй и переопредели process_frame()."""
     
@@ -70,16 +111,87 @@ class ImageProcessorNode(Node):
         """Переопредели в наследнике. frame — numpy array BGR."""
         raise NotImplementedError("Переопредели process_frame(frame)")
 
-import cv2
+#import cv2
+#import numpy as np
+#from hailo_platform import (VDevice, HEF, ConfigureParams, HailoStreamInterface, 
+#                            InputVStreamParams, OutputVStreamParams, InferVStreams)
+
+import sys
 import numpy as np
-from hailo_platform import (VDevice, HEF, ConfigureParams, HailoStreamInterface, 
-                            InputVStreamParams, OutputVStreamParams, InferVStreams)
+import cv2
+
+try:
+    # 1. Пытаемся импортировать реальный софт на роботе
+    from hailo_platform import (VDevice, HEF, ConfigureParams, HailoStreamInterface,
+                                InputVStreamParams, OutputVStreamParams, InferVStreams)
+except ImportError:
+    # 2. Если мы на ПК — на лету собираем виртуальную структуру hailo_platform
+    print("[MOCK] Плата Hailo-8 не обнаружена. Инициализирую симуляцию нейросети для ПК...")
+
+    class MockVStreamInfo:
+        def __init__(self):
+            self.name = "mock_input_layer_yolo"
+            self.shape = (1, 640, 640, 3) # Имитируем стандартный вход YOLOv8/YOLOv5
+
+    class MockHEF:
+        def __init__(self, hef_path): pass
+        def get_input_vstream_infos(self): return [MockVStreamInfo()]
+
+    class MockContextManager:
+        """Эмулирует вложенные контексты __enter__ и __exit__ чипа Hailo"""
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc_val, exc_tb): pass
+        
+        def infer(self, input_dict):
+            """
+            Имитация вывода нейросети на ПК.
+            Возвращает фейковые пустые тензоры (словари), чтобы ваш handle_hailo_result не падал.
+            """
+            # Название выходного слоя должно соответствовать архитектуре вашей сети.
+            # MagicMock просто вернет пустой массив. Вы можете заменить на реальные размерности:
+            return {"mock_output_layer": np.zeros((1, 84, 8400), dtype=np.float32)}
+
+    class MockParams:
+        @classmethod
+        def create_from_hef(cls, *args, **kwargs): return cls()
+        @classmethod
+        def make_from_network_group(cls, *args, **kwargs): return cls()
+
+    class MockDevice:
+        def __init__(self, *args, **kwargs): pass
+        def configure(self, *args, **kwargs): return [MockNetworkGroup()]
+
+    class MockNetworkGroup(MockContextManager):
+        def activate(self): return MockContextManager()
+
+    class MockStreamInterface:
+        PCIe = "PCIe"
+
+    # Создаем виртуальный модуль в системном кэше Python
+    from types import ModuleType
+    hailo_mod = ModuleType("hailo_platform")
+    hailo_mod.VDevice = MockDevice
+    hailo_mod.HEF = MockHEF
+    hailo_mod.ConfigureParams = MockParams
+    hailo_mod.HailoStreamInterface = MockStreamInterface
+    hailo_mod.InputVStreamParams = MockParams
+    hailo_mod.OutputVStreamParams = MockParams
+    hailo_mod.InferVStreams = MockContextManager
+
+    sys.modules["hailo_platform"] = hailo_mod
+    
+    # Повторяем импорт: теперь он заберет наши фейковые классы
+    from hailo_platform import (VDevice, HEF, ConfigureParams, HailoStreamInterface,
+                                InputVStreamParams, OutputVStreamParams, InferVStreams)
+
 
 class HailoProcessorNode(ImageProcessorNode):
     """
     Новый базовый класс для любых ИИ-нод на чипе Hailo-8.
     Наследуется от стандартного ImageProcessorNode вашего робота.
     """
+
     def __init__(self, driver, hef_path, fps=30, node_name=None):
         # Инициализируем старый базовый класс (он создаст таймер и привяжет driver)
         super().__init__(driver, fps=fps, node_name=node_name)
@@ -433,6 +545,17 @@ const STATE_MAP = {
 # 1. БАЗОВЫЙ КЛАСС-КЛИЕНТ АВТОПИЛОТА (DRIVER)
 # ==============================================================================
 
+
+class BTNode:
+    """Абстрактный узел дерева поведения."""
+
+    def tick(self, driver: 'RobotDriver') -> str:
+        raise NotImplementedError("Переопределите tick в наследнике")
+
+    def reset(self):
+        """Сброс внутреннего состояния. По умолчанию ничего не делает."""
+        pass
+
 class RobotDriver(Node):
     """
     Универсальный робот-драйвер.
@@ -529,8 +652,10 @@ class RobotDriver(Node):
         self._debug = value
 
     def _loop(self):
+        #print(f"\033[91m[sim loop 1\033[0m", flush=True)
         if not self.is_connected():
             return
+        #print(f"\033[91m[sim loop 2\033[0m", flush=True)
         if not self._active:
             print(f"\nРобот готов к миссии '{self.__class__.__name__}'.")
             input("Нажмите Enter для старта...")
@@ -797,9 +922,16 @@ class RobotDriver(Node):
     def _on_camera(self, msg):
         import cv2
         try:
+            # Выводим кодировку кадра, чтобы увидеть, не затерлась ли она в сети!
+            #enc = getattr(msg, 'encoding', 'NOT_FOUND')
+            #self.get_logger().error(f"camera: 1, Encoding in MSG: '{enc}'")
+            #self.get_logger().error(f"camera: 1")
             frame = self._cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            #self.get_logger().error(f"camera: 2")
             self.bb.update(last_frame=frame, camera_ready=True)
-        except Exception:
+            #self.get_logger().error(f"camera: 3")
+        except Exception as e:
+            self.get_logger().error(f"camera: {e}")
             pass
 
     def get_frame(self):
@@ -882,15 +1014,6 @@ class RobotDriver(Node):
 # 2. ЯДРО ДЕРЕВА ПОВЕДЕНИЯ
 # ==============================================================================
 
-class BTNode:
-    """Абстрактный узел дерева поведения."""
-
-    def tick(self, driver: RobotDriver) -> str:
-        raise NotImplementedError("Переопределите tick в наследнике")
-
-    def reset(self):
-        """Сброс внутреннего состояния. По умолчанию ничего не делает."""
-        pass
 
 
 class Sequence(BTNode):
@@ -1621,46 +1744,7 @@ class TimerAction(BTNode):
         self.child.reset()
 
 
-# ==============================================================================
-# 3.2 BLACKBOARD — общая память между узлами
-# ==============================================================================
 
-class Blackboard:
-    """Потокобезопасная общая память."""
-
-    def __init__(self):
-        self._data = {}
-        self._lock = threading.Lock()
-
-    def set(self, key: str, value):
-        with self._lock:
-            self._data[key] = value
-
-    def get(self, key: str, default=None):
-        with self._lock:
-            return self._data.get(key, default)
-
-    def has(self, key: str) -> bool:
-        with self._lock:
-            return key in self._data
-
-    def delete(self, key: str):
-        with self._lock:
-            if key in self._data:
-                del self._data[key]
-
-    def clear(self):
-        with self._lock:
-            self._data.clear()
-
-    def all(self) -> dict:
-        with self._lock:
-            return dict(self._data)
-
-    def update(self, **kwargs):
-        """Потокобезопасное обновление нескольких ключей."""
-        with self._lock:
-            self._data.update(kwargs)
 
 # ==============================================================================
 # 3.3 SUBTREE — переиспользуемый фрагмент дерева
