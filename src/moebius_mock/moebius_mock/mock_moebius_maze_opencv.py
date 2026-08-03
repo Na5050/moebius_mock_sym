@@ -1,3 +1,4 @@
+#Copyright (c) 2026 Jurij Polikarpov
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
@@ -118,7 +119,7 @@ class MockMoebiusMaze(Node):
 
 
         self.get_logger().info("Нода Moebius запущена (Разрешение камеры: 320x240, Векторный NumPy).")
-
+        
     def create_simulator_timer(self, period_sec, callback):
         """
         ДИНАМИЧЕСКИЙ АДАПТИВНЫЙ ТАЙМЕР СИМУЛЯТОРА.
@@ -127,42 +128,42 @@ class MockMoebiusMaze(Node):
         def timer_worker():
             import time
             next_tick = time.time()
-
+            
             # --- ПЕРЕМЕННЫЕ ДЛЯ РАСЧЕТА RTF ---
             last_report_wall_time = time.time()
             last_report_sim_time = self.sim_time_sec # Начальное SimTime симулятора
-
+            
             while True:
                 start_calc = time.time()
                 try:
                     # Вызываем физический шаг (update_loop)
                     callback()
                 except Exception as e:
-                    print(f"\033[91m[SIMULATOR CORE ERROR]: {e}\033[0m", flush=True)
-
+                    self.get_logger().info(f"[SIMULATOR CORE ERROR]: {e}")
+                
                 # --- ТАКТ ПОД СЧЕТ RTF (Раз в секунду реального времени) ---
                 current_wall_time = time.time()
                 wall_delta = current_wall_time - last_report_wall_time
-
-                if wall_delta >= 1.0: # Прошла 1 реальная секунда на часах хоста
+                
+                if wall_delta >= 10.0: # Прошла 1 реальная секунда на часах хоста
                     current_sim_time = self.sim_time_sec
                     sim_delta = current_sim_time - last_report_sim_time
-
+                    
                     # Главная формула: отношение виртуального времени к реальному
                     rtf = sim_delta / wall_delta
-
+                    
                     # Цветной красивый вывод фактора времени в консоль лаунчера
                     # Округляем до двух знаков для идеальной считываемости
-                    print(f"[\033[94mMOEBIUS CORE\033[0m] Real-Time Factor (RTF): \033[92m{rtf:.2f}\033[0m", flush=True)
-
+                    self.get_logger().info(f"[SIMULATOR CORE] Real-Time Factor (RTF): {rtf:.2f}")
+                    
                     # Сдвигаем точки отсчета на следующий круг
                     last_report_wall_time = current_wall_time
                     last_report_sim_time = current_sim_time
-
+                
                 # --- СТАНДАРТНАЯ АДАПТИВНАЯ МАТЕМАТИКА СОН СИМУЛЯТОРА ---
                 next_tick += period_sec
                 sleep_time = next_tick - time.time()
-
+                
                 if sleep_time > 0.005:
                     # Машина справляется (расчет < целевого FPS)
                     time.sleep(sleep_time)
@@ -170,7 +171,7 @@ class MockMoebiusMaze(Node):
                     # Процессор нагружен тяжелыми нодами ИИ. Уходим в Slow-Motion.
                     next_tick = time.time()
                     time.sleep(0.005) # Окно безопасности для выдоха ОС
-
+                    
         import threading
         threading.Thread(target=timer_worker, daemon=True, name="Moebius_Adaptive_Physics").start()
 

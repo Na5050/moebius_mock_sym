@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#Copyright (c) 2026 Jurij Polikarpov
 """
 Модуль: robot_driver.py
 Содержит:
@@ -658,7 +659,7 @@ class RobotDriver(Node):
         #print(f"\033[91m[sim loop 2\033[0m", flush=True)
         if not self._active:
             print(f"\nРобот готов к миссии '{self.__class__.__name__}'.")
-            input("Нажмите Enter для старта...")
+            #input("Нажмите Enter для старта...")
             self.get_logger().info(f"Лидар offset: x={self.bb.get('lidar_offset_x'):.3f}, y={self.bb.get('lidar_offset_y'):.3f}, ready={self.bb.get('lidar_offset_ready')}")
             self.get_logger().info("Запуск миссии...")
             self._active = True
