@@ -83,7 +83,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'robot_description': robot_desc,
-            'use_sim_time': True
+            'use_sim_time': True,
+            # Частота публикации TF в Гц (даже статических)
+            'publish_frequency': 30.0 
         }]
     )
 
@@ -93,8 +95,11 @@ def generate_launch_description():
         executable='rviz2',
         name='rviz2',
         output='screen',
+        # Используем ParameterValue для принудительной типизации bool
         parameters=[{'use_sim_time': True}],
-        condition=IfCondition(LaunchConfiguration('start_rviz'))
+        condition=IfCondition(LaunchConfiguration('start_rviz')),
+        respawn=True,       # <--- ОБЯЗАТЕЛЬНО ДОБАВИТЬ: автоматически перезапустит ноду при вылете
+        respawn_delay=2.0 
     )
 
     # Ваша нода автопилота
