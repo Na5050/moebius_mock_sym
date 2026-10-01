@@ -74,6 +74,14 @@ class PandaRenderer(ShowBase):
 
         self.cam_width = cam_w
         self.cam_height = cam_h
+
+        # Создаем ОДНУ постоянную текстуру для быстрого копирования кадров в RAM
+        from panda3d.core import Texture, GraphicsOutput
+        self.conversion_texture = Texture()
+        
+        # Принуждаем Panda3D асинхронно копировать кадр прямо в RAM-память текстуры на C++ уровне
+        self.win.addRenderTexture(self.conversion_texture, GraphicsOutput.RTM_copy_ram)
+
         
         # Настройка 4-канального offscreen-буфера в оперативной памяти (RGBA)
         #fb_props = FrameBufferProperties.getDefault()
@@ -341,42 +349,77 @@ class PandaRenderer(ShowBase):
             print(f"Ошибка 3D-рендеринга файлов дорожных знаков: {e}")
         self.taskMgr.add(self.panda_render_task, "PandaRenderTask")
 
+#    def panda_render_task(self, task):
+#        node = self.ros_node
+#        
+#        # Если фоновый поток еще не просил кадр — просто ждем
+#        if not node.render_requested:
+#            return task.cont
+#            
+#        node.render_requested = False
+#
+#        self.cam.setPos(float(node.x), float(node.y), 0.15)
+#        angle_deg = math.degrees(node.th) - 90.0
+#        self.cam.setHpr(angle_deg, 0, 0)
+#        self.graphicsEngine.renderFrame()
+#
+#        # Захват изображения кадра
+#        if self.win.getScreenshot(node.pnm_img):
+#            stream = StringStream()
+#            node.pnm_img.write(stream, "bmp")
+#            raw_bytes = stream.getData()
+#
+#            if raw_bytes:
+#                img_np = np.frombuffer(raw_bytes, dtype=np.uint8)
+#                frame = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+#
+#                if frame is not None and frame.size > 0:
+#                    node.publish_frame_message(frame)
+#
+#        return task.cont
+
     def panda_render_task(self, task):
         node = self.ros_node
-        
+
         # Если фоновый поток еще не просил кадр — просто ждем
         if not node.render_requested:
             return task.cont
-            
+
         node.render_requested = False
 
-#         # --- БЕЗОПАСНЫЙ РЕНДЕР СТРОГО В MAIN THREAD ---
-#         # Движение камеры берем из переменных ноды
-#         cam_x = 3.0 * math.sin(node.angle)
-#         cam_y = 5.0 + 3.0 * math.cos(node.angle)
-#         self.cam.setPos(cam_x, cam_y, 0.5)
-#         self.cam.lookAt(0, 5, -0.5)
-
-        # Вызываем рендеринг кадра (в родном потоке OpenGL)
         self.cam.setPos(float(node.x), float(node.y), 0.15)
         angle_deg = math.degrees(node.th) - 90.0
         self.cam.setHpr(angle_deg, 0, 0)
+        
+        # Рендерим кадр — в этот момент conversion_texture заполняется автоматически
         self.graphicsEngine.renderFrame()
 
-        # Захват изображения кадра
-        if self.win.getScreenshot(node.pnm_img):
-            stream = StringStream()
-            node.pnm_img.write(stream, "bmp")
-            raw_bytes = stream.getData()
-
+        # Проверяем, скопировались ли данные кадра в RAM текстуры
+        if self.conversion_texture.hasRamImage():
+            raw_bytes = self.conversion_texture.getRamImage()
+            
             if raw_bytes:
-                img_np = np.frombuffer(raw_bytes, dtype=np.uint8)
-                frame = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+                x_size = self.conversion_texture.getXSize()
+                y_size = self.conversion_texture.getYSize()
+                channels = self.conversion_texture.getNumComponents() # Обычно 4 (RGBA) для этого режима
+
+                # Создаем numpy array мгновенно (это чистый flat-массив без заголовков)
+                frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((y_size, x_size, channels))
+                
+                # Конвертируем цвета в BGR для OpenCV/ROS
+                if channels == 4:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                else:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                
+                # Переворачиваем картинку по вертикали (исправляем OpenGL-инверсию)
+                frame = cv2.flip(frame, 0)
 
                 if frame is not None and frame.size > 0:
                     node.publish_frame_message(frame)
 
         return task.cont
+
 
 class MockMoebiusMaze(Node):
     def __init__(self):
@@ -426,13 +469,13 @@ class MockMoebiusMaze(Node):
                     walls.append([float(x), float(x) + 1.0, ros_y, ros_y + 1.0])
 
         # --- ИНИЦИАЛИЗАЦИЯ 3D-ДВИЖОК ПО ОРИГИНАЛЬНОМУ SELF.WALLS ---
-        self.declare_parameter('line_points', [1.5, 1.5, 2.5, 1.5])
+        self.declare_parameter('line_points', [0.5, 0.5, 0.5, 0.5])
         self.declare_parameter('sign_width', 0.3)
         self.declare_parameter('sign_height', 0.3)
         self.declare_parameter('aruco_width', 0.4)
         self.declare_parameter('aruco_height', 0.4)
-        self.declare_parameter('aruco_markers', [2.0, 2.0, 0.0, 42.0]) # Пока не внедряем в физику
-        self.declare_parameter('road_signs_poses', [3.0, 2.0, 3.0]) # Позиции знаков (числа)
+        self.declare_parameter('aruco_markers', [0.0, 0.0, 0.0, 42.0]) # Пока не внедряем в физику
+        self.declare_parameter('road_signs_poses', [0.0, 0.0, 3.0]) # Позиции знаков (числа)
         self.declare_parameter('road_signs_files', ["red.png"]) # Имена файлов (строки)
 
         #self.bridge = CvBridge()
