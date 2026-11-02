@@ -90,6 +90,32 @@ def generate_launch_description():
     )
 
     # Визуализатор RViz2
+    cam_vw_node = Node(
+        package=mock_package,
+        executable='camera_viewer.py',
+        name='camera_viewer',
+        output='screen',
+        # Используем ParameterValue для принудительной типизации bool
+        parameters=[{'use_sim_time': True}],
+        condition=UnlessCondition(LaunchConfiguration('start_rviz')),
+        respawn=True,       # <--- ОБЯЗАТЕЛЬНО ДОБАВИТЬ: автоматически перезапустит ноду при вылете
+        respawn_delay=2.0 
+    )
+
+    # Визуализатор RViz2
+    map_vw_node = Node(
+        package=mock_package,
+        executable='map_odom_viewer.py',
+        name='map_odom_viewer',
+        output='screen',
+        # Используем ParameterValue для принудительной типизации bool
+        parameters=[{'use_sim_time': True}],
+        condition=UnlessCondition(LaunchConfiguration('start_rviz')),
+        respawn=True,       # <--- ОБЯЗАТЕЛЬНО ДОБАВИТЬ: автоматически перезапустит ноду при вылете
+        respawn_delay=2.0
+    )
+
+    # Визуализатор RViz2
     rviz_node = Node(
         package='rviz2',
         executable='rviz2',
@@ -99,7 +125,7 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}],
         condition=IfCondition(LaunchConfiguration('start_rviz')),
         respawn=True,       # <--- ОБЯЗАТЕЛЬНО ДОБАВИТЬ: автоматически перезапустит ноду при вылете
-        respawn_delay=2.0 
+        respawn_delay=2.0
     )
 
     # Ваша нода автопилота
@@ -121,6 +147,8 @@ def generate_launch_description():
         mock_robot_node,
         mock_robot_lite_node,
         robot_state_publisher_node,
+        cam_vw_node,
+        map_vw_node,
         rviz_node,
         autopilot_node
     ])

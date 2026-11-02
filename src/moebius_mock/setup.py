@@ -32,6 +32,8 @@ setup(
     entry_points={
         'console_scripts': [
             # Объявляем наш исполняемый python-файл как ROS2-ноду:
+            'map_odom_viewer.py = moebius_mock.map_odom_viewer:main',
+            'camera_viewer.py = moebius_mock.camera_viewer:main',
             'mock_moebius_maze.py = moebius_mock.mock_moebius_maze:main',
             'mock_moebius_maze_opencv.py = moebius_mock.mock_moebius_maze_opencv:main'
         ],
