@@ -1,3 +1,4 @@
+#Copyright (c) 2026 Jurij Polikarpov
 # Сначала импортируем ТОЛЬКО функцию настроек
 from panda3d.core import loadPrcFileData
 loadPrcFileData("", "window-type offscreen")
