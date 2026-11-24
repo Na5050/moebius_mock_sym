@@ -14,6 +14,7 @@ from sensor_msgs.msg import LaserScan, Image
 from rosgraph_msgs.msg import Clock
 from builtin_interfaces.msg import Time
 from nav_msgs.msg import OccupancyGrid, MapMetaData
+import ast
 import tf2_ros
 import os
 import math
@@ -57,7 +58,7 @@ class PandaRenderer(ShowBase):
     # Разрешение подложки пола: 512 пикселей на 1 метр лабиринта (1 пиксель = 2 мм)
     SCALE_M_TO_PX = 512.0
     #def __init__(self):
-    def __init__(self, ros_node_ref, cam_w, cam_h, walls, road_sgn_poses, road_sgn_files, maze_height, maze_width, line_points, aruco_markers, sign_w, sign_h, aruco_w, aruco_h):
+    def __init__(self, ros_node_ref, cam_w, cam_h, walls, road_sgn_poses, road_sgn_files, maze_height, maze_width, all_lines, aruco_markers, sign_w, sign_h, aruco_w, aruco_h):
         # 1. ХАК ДЛЯ СИСТЕМНЫХ ПУТЕЙ PANDA3D (Принудительно подтягиваем встроенные модели)
         import os
         import panda3d
@@ -135,11 +136,20 @@ class PandaRenderer(ShowBase):
         floor_img = np.ones((floor_px_h, floor_px_w, 3), dtype=np.uint8) * 220 
 
         # Отрисовка черной линии трассы толщиной 5 см (смещение +1 метр учтено)
-        if len(line_points) >= 6:
-            line_thickness = max(1, int(0.05 * scale_m_to_px))
-            pts = np.array(line_points).reshape(-1, 2)
-            px_pts = ((pts + 1.0) * scale_m_to_px).astype(np.int32)
-            cv2.polylines(floor_img, [px_pts], isClosed=False, color=(0, 0, 0), thickness=line_thickness)
+#        if len(line_points) >= 6:
+#            line_thickness = max(1, int(0.05 * scale_m_to_px))
+#            pts = np.array(line_points).reshape(-1, 2)
+#            px_pts = ((pts + 1.0) * scale_m_to_px).astype(np.int32)
+#            cv2.polylines(floor_img, [px_pts], isClosed=False, color=(0, 0, 0), thickness=line_thickness)
+
+        line_thickness = max(1, int(0.05 * scale_m_to_px))
+
+        for line_points in all_lines:
+            if len(line_points) >= 4  and len(line_points) % 2 == 0:
+                pts = np.array(line_points).reshape(-1, 2)
+                px_pts = ((pts + 1.0) * scale_m_to_px).astype(np.int32)
+                cv2.polylines(floor_img, [px_pts], isClosed=False, color=(0, 0, 0), thickness=line_thickness)
+
 
 #         pil_img = PILImage.fromarray(cv2.cvtColor(floor_img, cv2.COLOR_BGR2RGB))
 #         p3d_tex = Texture()
@@ -470,7 +480,8 @@ class MockMoebiusMaze(Node):
                     walls.append([float(x), float(x) + 1.0, ros_y, ros_y + 1.0])
 
         # --- ИНИЦИАЛИЗАЦИЯ 3D-ДВИЖОК ПО ОРИГИНАЛЬНОМУ SELF.WALLS ---
-        self.declare_parameter('line_points', [0.5, 0.5, 0.5, 0.5])
+        #self.declare_parameter('line_points', [0.5, 0.5, 0.5, 0.5])
+        self.declare_parameter('lines', ['[]'])
         self.declare_parameter('sign_width', 0.3)
         self.declare_parameter('sign_height', 0.3)
         self.declare_parameter('aruco_width', 0.4)
@@ -482,7 +493,13 @@ class MockMoebiusMaze(Node):
         #self.bridge = CvBridge()
 
         # Читаем параметры из YAML
-        line_pts = self.get_parameter('line_points').get_parameter_value().double_array_value
+        #line_pts = self.get_parameter('line_points').get_parameter_value().double_array_value
+        raw_lines = self.get_parameter('lines').get_parameter_value().string_array_value
+        all_lines = [
+            [float(x) for x in ast.literal_eval(line)] 
+            for line in raw_lines if line
+        ]
+
         aruco_mk = self.get_parameter('aruco_markers').get_parameter_value().double_array_value
         sign_w = self.get_parameter('sign_width').get_parameter_value().double_value
         sign_h = self.get_parameter('sign_height').get_parameter_value().double_value
@@ -638,10 +655,10 @@ class MockMoebiusMaze(Node):
         self.latest_time_msg = None
         self.pnm_img = PNMImage(self.cam_width, self.cam_height)
 
-        # Передаем оригинальный self.walls, созданный твоим кодом.
+        # Передаем оригинальный self.walls.
         self.renderer = PandaRenderer(self,
             self.cam_width, self.cam_height, self.walls, 
-            road_sgn_poses, road_sgn_files, self.maze_height, self.maze_width, line_pts, aruco_mk,
+            road_sgn_poses, road_sgn_files, self.maze_height, self.maze_width, all_lines, aruco_mk,
             sign_w, sign_h, aruco_w, aruco_h
         )
         self.timer = self.create_simulator_timer(self.dt, self.update_loop)
